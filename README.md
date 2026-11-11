@@ -105,3 +105,7 @@ Development: `./build.sh test` runs the tests. With Rust and Node installed, run
 0.1 was a command-line watcher configured with a TOML file. Subscriptions and settings now live
 in the UI; the TOML configuration, the `command` and `stdout` notifiers and the RSS and
 GitHub-repository sources are gone. Webhook and ntfy remain.
+
+## License
+
+[MIT](LICENSE). The vulnerability data the app fetches stays under its sources' own terms.
