@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/server"]
+# The Android app (Tauri) is its own workspace so the server never pulls in webview toolchains.
+exclude = ["ui/src-tauri"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+strip = true
+lto = "thin"
+opt-level = "s"

@@ -1,0 +1,17 @@
+[package]
+name = "vulnwatch-core"
+description = "vulnwatch engine: product catalog, vulnerability sources, subscriptions, filters, alerts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+flate2 = "1"
+log = "0.4"
+regex = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }

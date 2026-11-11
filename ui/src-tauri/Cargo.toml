@@ -1,0 +1,30 @@
+[package]
+name = "vulnwatch-app"
+description = "vulnwatch as an app (Android, and desktop for development): the web UI in a webview on top of the same core"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "vulnwatch_app"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+vulnwatch-core = { path = "../../crates/core" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+# Its own workspace, so building the server never needs the webview toolchain.
+[workspace]
+
+[profile.release]
+strip = true
+lto = "thin"
+opt-level = "s"
