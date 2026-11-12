@@ -1,7 +1,10 @@
 //! CIRCL Vulnerability-Lookup (https://vulnerability.circl.lu): full CVE records searchable by the
 //! vendor/product names CNAs publish. Fills the gap for CVEs NVD has not yet given a CPE.
 
+use std::time::Duration;
+
 use anyhow::Result;
+use serde_json::Value;
 
 use super::cve5;
 use crate::model::Advisory;
@@ -16,15 +19,32 @@ fn seg(s: &str) -> String {
         .collect()
 }
 
-/// Most recent records for a vendor/product (one page).
-pub fn by_product(net: &Net, vendor: &str, product: &str, count: usize) -> Result<Vec<Advisory>> {
-    by_product_page(net, vendor, product, count, 1)
+/// One request, or with `patient` up to three: the service answers 502/503 for a few seconds at a
+/// time when it is busy, and a second try usually gets through.
+fn fetch(net: &Net, url: &str, query: &[(&str, &str)], patient: bool) -> Result<Value> {
+    let mut delay = Duration::from_millis(800);
+    for attempt in 0.. {
+        match net.get_json(url, query, &[]) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let busy = matches!(status_of(&e), Some(429 | 500..=599));
+                if !patient || !busy || attempt == 2 {
+                    return Err(e);
+                }
+                log::warn!("CIRCL: {e:#}; retrying in {delay:?}");
+                std::thread::sleep(delay);
+                delay *= 3;
+            }
+        }
+    }
+    unreachable!()
 }
 
-/// Page `page` (from 1, newest first) of the records for a vendor/product.
-pub fn by_product_page(net: &Net, vendor: &str, product: &str, count: usize, page: usize) -> Result<Vec<Advisory>> {
+/// Page `page` (from 1, newest first) of the records for a vendor/product. `patient` retries
+/// while the service is busy (a few seconds at most).
+pub fn by_product_page(net: &Net, vendor: &str, product: &str, count: usize, page: usize, patient: bool) -> Result<Vec<Advisory>> {
     let url = format!("{BASE}/{}/{}", seg(vendor), seg(product));
-    let v = match net.get_json(&url, &[("per_page", &count.to_string()), ("page", &page.to_string())], &[]) {
+    let v = match fetch(net, &url, &[("per_page", &count.to_string()), ("page", &page.to_string())], patient) {
         Ok(v) => v,
         Err(e) if status_of(&e) == Some(404) => return Ok(vec![]),
         Err(e) => return Err(e),

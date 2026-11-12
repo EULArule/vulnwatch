@@ -1,7 +1,7 @@
 [package]
 name = "vulnwatch-app"
 description = "vulnwatch as an app (Android, and desktop for development): the web UI in a webview on top of the same core"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT"
 

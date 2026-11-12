@@ -46,6 +46,10 @@ pub struct Settings {
     pub nvd_api_key: String,
     /// Merge CIRCL Vulnerability-Lookup results into product pages.
     pub use_circl: bool,
+    /// Ask ENISA's EUVD for those CVEs when CIRCL is switched off or not answering.
+    pub use_euvd: bool,
+    /// Optional CVEdetails.com API token; with one, its listing is merged into product pages.
+    pub cvedetails_token: String,
     /// Also follow the cve.org delta feed (faster first sight, more requests).
     pub use_cvelist: bool,
     /// Fetch EPSS exploit-probability scores.
@@ -65,6 +69,8 @@ impl Default for Settings {
             max_age_days: 30,
             nvd_api_key: String::new(),
             use_circl: true,
+            use_euvd: true,
+            cvedetails_token: String::new(),
             use_cvelist: false,
             use_epss: true,
             ntfy: Ntfy::default(),
@@ -86,12 +92,17 @@ impl Settings {
             self.theme = "system".into();
         }
         self.nvd_api_key = self.nvd_api_key.trim().to_string();
+        self.cvedetails_token = self.cvedetails_token.trim().trim_start_matches("Bearer ").trim().to_string();
         self.ntfy.server = self.ntfy.server.trim().trim_end_matches('/').to_string();
         self.ntfy.topic = self.ntfy.topic.trim().to_string();
         self.webhook.url = self.webhook.url.trim().to_string();
         self.remote.url = self.remote.url.trim().trim_end_matches('/').to_string();
         self.remote.token = self.remote.token.trim().to_string();
         self
+    }
+
+    pub fn cvedetails_key(&self) -> Option<&str> {
+        Some(self.cvedetails_token.as_str()).filter(|k| !k.is_empty())
     }
 
     pub fn nvd_key(&self) -> Option<&str> {

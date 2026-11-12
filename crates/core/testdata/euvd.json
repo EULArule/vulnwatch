@@ -1,0 +1,231 @@
+{
+ "items": [
+  {
+   "id": "EUVD-2026-121531",
+   "enisaUuid": "a0ed6f72-ee32-36d9-a07a-857985ef687b",
+   "description": "In the Linux kernel, the following vulnerability has been resolved:\n\nxen-netback: Zero out sring pointers on unmap\n\nIf xenvif_map_frontend_data_rings() fails when a ring is already mapped,\nit unmaps them via xenvif_unmap_frontend_data_rings() which keeps the\nring pointers unchanged. xenvif_connect_data()'s cleanup path calls\nxenvif_disconnect_queue() which in turn calls\nxenvif_unmap_frontend_data_rings() again, which will attempt to unmap the\npointers a second time.\n\nZero out the ring pointers after they are unmapped to avoid this issue.\n\nThis is XSA-532",
+   "datePublished": "Nov 10, 2026, 6:16:54 PM",
+   "dateUpdated": "Nov 10, 2026, 9:05:27 PM",
+   "baseScore": 0.0,
+   "references": "https://git.kernel.org/stable/c/87fd475dc4e354088f6534285388e7b061f54b35\nhttps://git.kernel.org/stable/c/c5f54af611ff6fe1d53fa05d8e87b469dc56122b\nhttps://git.kernel.org/stable/c/e7ba61734d6ad6adfd5bf617052e590743211669\n",
+   "aliases": "GHSA-w332-8qhm-mmxw\nCVE-2026-99287\n",
+   "assigner": "Linux",
+   "epss": 0.17,
+   "enisaIdProduct": [
+    {
+     "id": "3c00fe85-2dd9-32d8-9022-587758affc4e",
+     "product": {
+      "name": "Linux",
+      "vendor": {
+       "name": "Linux"
+      }
+     },
+     "product_version": "patch: 6.12.117"
+    },
+    {
+     "id": "4b1a4e9c-7f95-319f-89ed-2842a60c38ba",
+     "product": {
+      "name": "Linux",
+      "vendor": {
+       "name": "Linux"
+      }
+     },
+     "product_version": "2ac061ce97f413bfbbdd768f7d2e0fda2e8170df <c5f54af611ff6fe1d53fa05d8e87b469dc56122b"
+    },
+    {
+     "id": "50dc4c9b-155e-3c84-a9cf-6dcc972c50a1",
+     "product": {
+      "name": "Linux",
+      "vendor": {
+       "name": "Linux"
+      }
+     },
+     "product_version": "patch: 6.18.63"
+    },
+    {
+     "id": "5dd711af-7d61-3bbc-81d7-2c928cb93cf0",
+     "product": {
+      "name": "Linux",
+      "vendor": {
+       "name": "Linux"
+      }
+     },
+     "product_version": "2ac061ce97f413bfbbdd768f7d2e0fda2e8170df <87fd475dc4e354088f6534285388e7b061f54b35"
+    },
+    {
+     "id": "9006532b-7f0a-353c-a880-e51adc06961d",
+     "product": {
+      "name": "Linux",
+      "vendor": {
+       "name": "Linux"
+      }
+     },
+     "product_version": "patch: 7.3.4"
+    },
+    {
+     "id": "b4304d86-3616-3df8-b102-3227c81afc3b",
+     "product": {
+      "name": "Linux",
+      "vendor": {
+       "name": "Linux"
+      }
+     },
+     "product_version": "2ac061ce97f413bfbbdd768f7d2e0fda2e8170df <e7ba61734d6ad6adfd5bf617052e590743211669"
+    },
+    {
+     "id": "c246bfd3-8d6b-3af6-a680-62c2e681fc88",
+     "product": {
+      "name": "Linux",
+      "vendor": {
+       "name": "Linux"
+      }
+     },
+     "product_version": "patch: 0"
+    },
+    {
+     "id": "eb415019-7f35-365b-8a1f-33a745bbfbfc",
+     "product": {
+      "name": "Linux",
+      "vendor": {
+       "name": "Linux"
+      }
+     },
+     "product_version": "5.5"
+    }
+   ],
+   "enisaIdVendor": [
+    {
+     "id": "56f78edf-be62-3cd3-9961-cdafd35e3882",
+     "vendor": {
+      "name": "Linux"
+     }
+    }
+   ]
+  },
+  {
+   "id": "EUVD-2026-119281",
+   "enisaUuid": "d64f7d58-49b2-384d-bb52-83aee0acb6f8",
+   "description": "In the Linux kernel, the following vulnerability has been resolved:\n\ntun: Require CAP_NET_ADMIN to attach to an ownerless device\n\nTwenty years ago I made creating a tuntap device require CAP_NET_ADMIN\nin commit ca6bb5d7ab22 (\"[NET]: Require CAP_NET_ADMIN to create tuntap\ndevices.\")\n\nThe idea was to allow the permissions on /dev/net/tun to be relaxed to\n0666 and thus allow owners of tun devices assigned with TUNSETOWNER to\nactually open it and get at their devices.\n\nWhat we missed at the time was that persistent devices with *no* owner\nwere already essentially world-consumable, and anyone who could open\nthe device node could also attach to those.\n\nEven then, using persistent devices with no explicitly set owner — on\nthe (false) presumption that CAP_NET_ADMIN would be required to open\nthem — wasn't an egregious userspace bug. There are cases where it does\nmake sense to separate the creation/configuration of the netdevice, from\nthe process which shovels packets into it.\n\nSince then, TUNSETGROUP was added a year later in commit 8c644623fe7e\n(\"[NET]: Allow group ownership of TUN/TAP devices.\"). Its commit message\nnoted that if both uid and gid are set, both have to match (in itself a\nbizarre choice) — but still not that with *neither* set, no permission\nat all was required.\n\nThen in 2012 commit c8d68e6be1c3 (\"tuntap: multiqueue support\") allowed\nnew queues to be attached to a device from the moment of its creation,\nwith no way for userspace to close the race between creation and a\nsubsequent TUNSET{OWNER,GROUP}.\n\nIn 2024, commit 3ca459eaba1bf (\"tun: fix group permission check\") tried\nto fix things to be saner: only require the user *or* the group to\nmatch, in line with standard POSIX permissions, and require\nCAP_NET_ADMIN if neither the user nor group authorised the access\n(although it put the CAP_NET_ADMIN check first, and would wrongly have\nreported the capability as having been used even when it was not).\n\nThat fix was reverted in commit a70c7b3cbc06 (\"tun: revert fix group\npermission check\") due to allegedly causing a regression in an selinux\ntest suite which *expected* the attachment to succeed when authorised\nby none of user, group, nor CAP_NET_ADMIN:\nhttps://lore.kernel.org/netdev/CAFqZXNtkCBT4f+PwyVRmQGoT3p1eVa01fCG_aNtpt6dakXncUg@mail.gmail.com/\n\nWe should not break UAPI. But we don't have to consider an selinux test\ncase which deliberately exercises a security flaw to be UAPI worth\npreserving either. To which end, I have fixed it in selinux-testsuite\ncommit b2f894f0016b (\"tests/tun_tap: set an owner on the device for the\nrelabel tests\").\n\nSo: fix the lack of CAP_NET_ADMIN check on devices which *haven't* been\nassigned an owner or group, while leaving the weird tun ownership model\nas it was (user *and* group have to match, if both are set). If someone\nstill wants to fix the latter (which wasn't actually the reason the\nprevious attempt was reverted), they can do it under separate cover.\n\nPermit attaching to an existing device only if an owner and/or group was\nset and the caller matches all that were set, or if the caller has\nCAP_NET_ADMIN. The only behavioural change is that a device with no\nowner or group now requires CAP_NET_ADMIN to attach — precisely the\nloophole we want to close.\n\nAnd put the CAP_NET_ADMIN check in the right place this time.",
+   "datePublished": "Nov 7, 2026, 2:08:47 PM",
+   "dateUpdated": "Nov 10, 2026, 6:15:28 PM",
+   "baseScore": 7.8,
+   "baseScoreVersion": "3.1",
+   "baseScoreVector": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+   "references": "https://git.kernel.org/stable/c/e0d98aab41b79b88609f33fb4d8e7a80ab8f648d\nhttps://git.kernel.org/stable/c/2f92c0286cfd58bff9d6d54c01a771073d5eb775\nhttps://git.kernel.org/stable/c/e53d1cf05da8ea58a5743b7ce5894fb51b0b9700\nhttps://git.kernel.org/stable/c/ffdf678dd16610e3f006dac904bd37c09684673c\n",
+   "aliases": "CVE-2026-99281\nGHSA-cfrf-w8r8-rf8x\n",
+   "assigner": "Linux",
+   "epss": 0.12,
+   "enisaIdProduct": [
+    {
+     "id": "2511a20d-1897-3b04-b9bc-305e182767f9",
+     "product": {
+      "name": "Linux",
+      "vendor": {
+       "name": "Linux"
+      }
+     },
+     "product_version": "patch: 7.4-rc1"
+    },
+    {
+     "id": "544f2891-fcfb-3f67-9e6c-8a8f8255d6a9",
+     "product": {
+      "name": "Linux",
+      "vendor": {
+       "name": "Linux"
+      }
+     },
+     "product_version": "patch: 6.12.117"
+    },
+    {
+     "id": "6158c603-b4b4-3f56-bad5-753a9c034391",
+     "product": {
+      "name": "Linux",
+      "vendor": {
+       "name": "Linux"
+      }
+     },
+     "product_version": "2.6.18"
+    },
+    {
+     "id": "6926bed3-0309-3885-b7a2-00d8c2bc5b41",
+     "product": {
+      "name": "Linux",
+      "vendor": {
+       "name": "Linux"
+      }
+     },
+     "product_version": "patch: 0"
+    },
+    {
+     "id": "7f1f16e3-9a09-3ae4-80d4-50daf44a5b68",
+     "product": {
+      "name": "Linux",
+      "vendor": {
+       "name": "Linux"
+      }
+     },
+     "product_version": "ca6bb5d7ab22ac79f608fe6cbc6b12de6a5a19f0 <e53d1cf05da8ea58a5743b7ce5894fb51b0b9700"
+    },
+    {
+     "id": "8cc699b5-116c-3007-bbb4-ff13117ec8d1",
+     "product": {
+      "name": "Linux",
+      "vendor": {
+       "name": "Linux"
+      }
+     },
+     "product_version": "patch: 6.18.61"
+    },
+    {
+     "id": "a85f145d-222e-38df-be18-45403aa69f96",
+     "product": {
+      "name": "Linux",
+      "vendor": {
+       "name": "Linux"
+      }
+     },
+     "product_version": "ca6bb5d7ab22ac79f608fe6cbc6b12de6a5a19f0 <2f92c0286cfd58bff9d6d54c01a771073d5eb775"
+    },
+    {
+     "id": "b827a877-7a87-36a1-a419-b15ce413615a",
+     "product": {
+      "name": "Linux",
+      "vendor": {
+       "name": "Linux"
+      }
+     },
+     "product_version": "patch: 7.3.2"
+    },
+    {
+     "id": "bbe8512d-be0d-3ada-99c0-2c4fb54d46e0",
+     "product": {
+      "name": "Linux",
+      "vendor": {
+       "name": "Linux"
+      }
+     },
+     "product_version": "ca6bb5d7ab22ac79f608fe6cbc6b12de6a5a19f0 <ffdf678dd16610e3f006dac904bd37c09684673c"
+    },
+    {
+     "id": "df2f16ea-0bb4-3bc2-a00e-9c17da6324cc",
+     "product": {
+      "name": "Linux",
+      "vendor": {
+       "name": "Linux"
+      }
+     },
+     "product_version": "ca6bb5d7ab22ac79f608fe6cbc6b12de6a5a19f0 <e0d98aab41b79b88609f33fb4d8e7a80ab8f648d"
+    }
+   ],
+   "enisaIdVendor": [
+    {
+     "id": "7abecfaa-cd0a-3c0e-9c4e-e844b6907f80",
+     "vendor": {
+      "name": "Linux"
+     }
+    }
+   ]
+  }
+ ],
+ "total": 2
+}

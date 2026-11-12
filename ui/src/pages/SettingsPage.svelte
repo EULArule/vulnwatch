@@ -224,6 +224,10 @@
         <input type="checkbox" bind:checked={s.use_circl} />
       </label>
       <label class="switch">
+        <span class="label">ENISA EUVD<small>Supplies those CVEs when CIRCL is switched off or not answering</small></span>
+        <input type="checkbox" bind:checked={s.use_euvd} />
+      </label>
+      <label class="switch">
         <span class="label">EPSS scores<small>Exploit likelihood from FIRST.org, shown on lists and usable in filters</small></span>
         <input type="checkbox" bind:checked={s.use_epss} />
       </label>
@@ -234,6 +238,10 @@
       <label class="field">
         NVD API key <span class="hint">optional — lists load faster and are rate-limited less. Free from nvd.nist.gov.</span>
         <input class="input mono" type="password" bind:value={s.nvd_api_key} autocomplete="off" />
+      </label>
+      <label class="field">
+        CVEdetails API token <span class="hint">optional — adds cvedetails.com's listing to product pages. From your cvedetails.com account.</span>
+        <input class="input mono" type="password" bind:value={s.cvedetails_token} autocomplete="off" />
       </label>
       <div class="field">
         Ignore vulnerabilities published more than

@@ -68,7 +68,9 @@ server, sharing its subscriptions and alerts, and only asks it "anything new?" i
 |---|---|
 | [NVD](https://nvd.nist.gov/developers/vulnerabilities) | Product listings, new and changed CVEs, CVSS scores |
 | [cve.org](https://www.cve.org) | CVE records as published by the vendor (often earlier and with fixed versions); optional fast delta feed |
-| [CIRCL Vulnerability-Lookup](https://vulnerability.circl.lu) | Second opinion on product listings |
+| [CIRCL Vulnerability-Lookup](https://vulnerability.circl.lu) | CVEs on product pages that NVD has not analysed yet (it runs weeks behind) |
+| [ENISA EUVD](https://euvd.enisa.europa.eu) | The same, whenever CIRCL is not answering |
+| [CVEdetails](https://www.cvedetails.com) | Optional addition to product pages; needs an API token from a cvedetails account (Settings → Sources) |
 | [OSV](https://osv.dev) | Package advisories (GitHub advisories, PyPA, RustSec, Go, distributions, …) |
 | [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) | "Exploited in the wild" |
 | [FIRST EPSS](https://www.first.org/epss/) | Probability of exploitation |

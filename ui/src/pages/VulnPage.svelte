@@ -58,6 +58,9 @@
     out.push({ name: 'OSV', note: used('osv'), url: `https://osv.dev/vulnerability/${has('osv') && !cve ? v.id : (ids.find((i) => !i.startsWith('CVE-')) ?? v.id)}` });
     if (cve) {
       out.push({ name: 'CIRCL Vulnerability-Lookup', note: used('circl'), url: `https://vulnerability.circl.lu/vuln/${cve}` });
+      const euvd = ids.find((i) => i.startsWith('EUVD-'));
+      if (euvd) out.push({ name: 'ENISA EUVD', note: used('euvd'), url: `https://euvd.enisa.europa.eu/vulnerability/${euvd}` });
+      if (has('cvedetails')) out.push({ name: 'CVEdetails', note: used('cvedetails'), url: `https://www.cvedetails.com/cve/${cve}/` });
       if (v.exploited) out.push({ name: 'CISA Known Exploited', note: 'listed as exploited', url: `https://www.cisa.gov/known-exploited-vulnerabilities-catalog?search_api_fulltext=${cve}` });
       out.push({ name: 'EPSS', note: 'exploit likelihood', url: `https://api.first.org/data/v1/epss?cve=${cve}` });
     }

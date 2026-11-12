@@ -292,13 +292,18 @@ impl Store {
     // ── response cache ──────────────────────────────────────────────────────
 
     pub fn cache_get(&self, key: &str, max_age_secs: i64) -> Result<Option<Value>> {
+        Ok(self.cache_entry(key, max_age_secs)?.map(|(_, body)| body))
+    }
+
+    /// Like `cache_get`, with the time (Unix seconds) the entry was stored.
+    pub fn cache_entry(&self, key: &str, max_age_secs: i64) -> Result<Option<(i64, Value)>> {
         let row: Option<(i64, String)> = self
             .conn
             .query_row("SELECT fetched_at, body FROM cache WHERE key = ?1", [key], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
         Ok(row
             .filter(|(at, _)| Utc::now().timestamp() - at <= max_age_secs)
-            .and_then(|(_, body)| serde_json::from_str(&body).ok()))
+            .and_then(|(at, body)| Some((at, serde_json::from_str(&body).ok()?))))
     }
 
     pub fn cache_put(&self, key: &str, body: &Value) -> Result<()> {

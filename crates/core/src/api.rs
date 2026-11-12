@@ -4,7 +4,7 @@
 //! app is paired with a server, most methods are forwarded there.
 
 use anyhow::{anyhow, bail, Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -13,13 +13,21 @@ use crate::matcher::{cpe_vendor_product, suggest_keywords, Compiled, Filter, Sub
 use crate::model::{merge_all, Advisory};
 use crate::notify::{self, Notification};
 use crate::settings::Settings;
-use crate::sources::{circl, cve5, nvd, osv};
+use crate::sources::{circl, cve5, cvedetails, euvd, nvd, osv};
 use crate::{catalog, Core, VERSION};
 
 /// Vulnerabilities per page on product pages.
 const PAGE: usize = 100;
 /// How long fetched lists/details are reused.
 const CACHE_SECS: i64 = 30 * 60;
+/// How long CIRCL's last answer may stand in for it while it is down (the cache keeps a week).
+const STALE_SECS: i64 = 7 * 86400;
+
+const CIRCL_DOWN: &str = "circl-down";
+
+fn circl_key(vendor: &str, product: &str) -> String {
+    format!("circl:{vendor}:{product}")
+}
 
 #[derive(Serialize, Deserialize)]
 struct Listing {
@@ -244,7 +252,11 @@ impl Core {
                 if new.remote != settings.remote {
                     db.delete("remote_last_alert")?;
                 }
-                if new.nvd_api_key != settings.nvd_api_key || new.use_circl != settings.use_circl {
+                if new.nvd_api_key != settings.nvd_api_key
+                    || new.use_circl != settings.use_circl
+                    || new.use_euvd != settings.use_euvd
+                    || new.cvedetails_token != settings.cvedetails_token
+                {
                     db.cache_clear()?;
                 }
                 db.set("settings", &new)?;
@@ -339,7 +351,15 @@ impl Core {
                 let alias: Option<(String, String)> =
                     self.db().cache_get(&alias_key, 30 * 86400)?.and_then(|v| serde_json::from_value(v).ok());
                 let (v, p) = alias.as_ref().map(|(v, p)| (v.as_str(), p.as_str())).unwrap_or((vendor, product));
-                circl::by_product(&self.net, v, p, PAGE).unwrap_or_default()
+                // No waiting here: CIRCL right now, or else what it said last time.
+                let live = match self.circl_down() {
+                    None => circl::by_product_page(&self.net, v, p, PAGE, 1, false).ok(),
+                    Some(_) => None,
+                };
+                match live {
+                    Some(list) => list,
+                    None => self.db().cache_get(&circl_key(v, p), STALE_SECS)?.and_then(|c| serde_json::from_value(c).ok()).unwrap_or_default(),
+                }
             }
             _ => vec![],
         };
@@ -351,6 +371,97 @@ impl Core {
         Ok(Listing { total: items.len(), next_end: Some(usize::MAX), items, notes: vec![], approx: false })
     }
 
+    /// Page `k` (from 1, newest first) of the CVEs published under a vendor/product name, as the
+    /// publishers spell it. CIRCL answers this; when it is switched off or down, EUVD does (for
+    /// the CVEs published around or after `newest_nvd`, the ones NVD cannot supply yet); failing
+    /// that, CIRCL's last answer. What had to be substituted is added to `notes`.
+    fn by_publisher_name(
+        &self,
+        settings: &Settings,
+        vendor: &str,
+        product: &str,
+        k: usize,
+        newest_nvd: Option<DateTime<Utc>>,
+        notes: &mut Vec<String>,
+    ) -> Vec<Advisory> {
+        let key = circl_key(vendor, product);
+        let mut down = self.circl_down();
+        if settings.use_circl && down.is_none() {
+            match circl::by_product_page(&self.net, vendor, product, PAGE, k, true) {
+                Ok(list) => {
+                    if k == 1 {
+                        self.db().cache_put(&key, &json!(list)).ok();
+                    }
+                    return list;
+                }
+                Err(e) => {
+                    let msg = format!("CIRCL is not answering ({e:#})");
+                    self.db().cache_put(CIRCL_DOWN, &json!(msg)).ok();
+                    down = Some(msg);
+                }
+            }
+        }
+        if settings.use_euvd {
+            match self.euvd_since(vendor, product, newest_nvd) {
+                Ok(found) => {
+                    if let Some(down) = &down {
+                        notes.push(format!("{down}. The newest CVEs come from ENISA's EUVD instead."));
+                    }
+                    if found.truncated {
+                        notes.push("EUVD has more recent CVEs for this product than could be loaded; some from before the newest may be missing.".into());
+                    }
+                    return found.items.into_iter().skip((k - 1) * PAGE).take(PAGE).collect();
+                }
+                Err(e) => match &mut down {
+                    Some(down) => down.push_str(&format!(", and neither is EUVD ({e:#})")),
+                    None => down = Some(format!("EUVD is not answering ({e:#})")),
+                },
+            }
+        }
+        let Some(down) = down else { return vec![] };
+        let saved: Option<(i64, Vec<Advisory>)> = match k {
+            1 => self.db().cache_entry(&key, STALE_SECS).ok().flatten().and_then(|(at, v)| Some((at, serde_json::from_value(v).ok()?))),
+            _ => None,
+        };
+        match saved {
+            Some((at, list)) => {
+                let hours = (Utc::now().timestamp() - at) / 3600;
+                let age = match hours {
+                    0 => "less than an hour ago".to_string(),
+                    1..=47 => format!("{hours} h ago"),
+                    _ => format!("{} days ago", hours / 24),
+                };
+                notes.push(format!("{down}. Showing what CIRCL listed {age}; newer CVEs may be missing."));
+                list
+            }
+            None => {
+                notes.push(format!("{down}. CVEs that NVD has not analysed yet may be missing."));
+                vec![]
+            }
+        }
+    }
+
+    /// Set for a couple of minutes after CIRCL failed, so that the other lookups of the same page,
+    /// and the pages after it, do not each wait for it again. Refreshing a list asks it anew.
+    fn circl_down(&self) -> Option<String> {
+        self.db().cache_get(CIRCL_DOWN, 120).ok().flatten().and_then(|v| v.as_str().map(str::to_string))
+    }
+
+    /// EUVD's records for a name since shortly before `newest_nvd`, kept for a while: every page
+    /// of a listing is cut from the same download.
+    fn euvd_since(&self, vendor: &str, product: &str, newest_nvd: Option<DateTime<Utc>>) -> Result<euvd::Found> {
+        // A week of overlap: NVD does not analyse in order of publication.
+        let floor = Utc::now() - chrono::Duration::days(120);
+        let from = newest_nvd.map(|d| d - chrono::Duration::days(7)).unwrap_or(floor).max(floor).date_naive();
+        let key = format!("euvd:{vendor}:{product}:{from}");
+        if let Some((items, truncated)) = self.db().cache_get(&key, CACHE_SECS)?.and_then(|v| serde_json::from_value(v).ok()) {
+            return Ok(euvd::Found { items, truncated });
+        }
+        let found = euvd::since(&self.net, vendor, product, from)?;
+        self.db().cache_put(&key, &json!((&found.items, found.truncated)))?;
+        Ok(found)
+    }
+
     fn listing(&self, settings: &Settings, target: &Target, end: Option<usize>, refresh: bool) -> Result<Listing> {
         let cache_key = format!("list:{}:{}", serde_json::to_string(target)?, end.map(|e| e.to_string()).unwrap_or_default());
         if !refresh {
@@ -358,8 +469,11 @@ impl Core {
                 return Ok(hit);
             }
         }
+        if refresh {
+            self.db().cache_put(CIRCL_DOWN, &Value::Null)?;
+        }
         let key = settings.nvd_key();
-        let mut notes = vec![];
+        let mut notes: Vec<String> = vec![];
         // How many NVD had last time (kept for a week): lets the newest page skip the counting request.
         let total_key = format!("nvd-total:{}", serde_json::to_string(target)?);
         // `end` values from AHEAD up are not NVD positions: AHEAD + k is page k of the CVEs that
@@ -410,7 +524,7 @@ impl Core {
                 if fresh && end.is_none() {
                     self.db().cache_put(&first_key, &json!((total, next, &items, approx)))?;
                 }
-                if end.is_none() && settings.use_circl {
+                if end.is_none() && (settings.use_circl || settings.use_euvd || settings.cvedetails_key().is_some()) {
                     // CIRCL indexes vendor-assigned product names too, so it knows CVEs NVD has
                     // not analysed yet. Only merge what belongs on this (newest) page.
                     // NVD takes weeks to attach its product name to a new CVE. Until then a CVE
@@ -427,46 +541,37 @@ impl Core {
                     };
                     let k = ahead_page.unwrap_or(1);
                     let newest_nvd = items.iter().filter_map(|a| a.published).max();
-                    let mut ahead = vec![];
-                    if let Some((v, p)) = &alias {
-                        match circl::by_product_page(&self.net, v, p, PAGE, k) {
-                            Ok(list) => ahead = list,
-                            Err(e) => notes.push(format!("CIRCL lookup failed: {e:#}")),
-                        }
-                    }
+                    let ahead = match &alias {
+                        Some((v, p)) => self.by_publisher_name(settings, v, p, k, newest_nvd, &mut notes),
+                        None => vec![],
+                    };
                     // A whole page newer than NVD's newest: show it by itself and continue with
                     // the next such page, so no stretch of recent CVEs is skipped.
                     let gap = k < 200
                         && !ahead.is_empty()
                         && newest_nvd.is_some_and(|d| ahead.iter().all(|a| a.published.is_some_and(|p| p > d)));
-                    let found = match (gap, k) {
-                        (true, _) => {
-                            items = std::mem::take(&mut ahead);
-                            next = Some(AHEAD + k + 1);
-                            approx = true;
-                            Ok(vec![])
-                        }
-                        (false, 1) => circl::by_product(&self.net, vendor, product, PAGE),
-                        _ => Ok(vec![]),
-                    };
-                    match found.map(|mut l| {
-                        l.extend(ahead);
-                        l
-                    }) {
-                        Ok(extra) => {
-                            let oldest = items.iter().filter_map(|a| a.published).min();
-                            let before = items.len();
-                            let keep = extra.into_iter().filter(|a| {
-                                items.iter().any(|i| i.id == a.id)
-                                    || next.is_none()
-                                    || matches!((a.published, oldest), (Some(p), Some(o)) if p >= o)
-                            });
-                            let merged: Vec<Advisory> = keep.collect();
-                            items = merge_all(items.into_iter().chain(merged));
-                            total += items.len() - before;
-                        }
-                        Err(e) => notes.push(format!("CIRCL lookup failed: {e:#}")),
+                    let mut extra = ahead;
+                    if gap {
+                        items = std::mem::take(&mut extra);
+                        next = Some(AHEAD + k + 1);
+                        approx = true;
+                    } else if k == 1 {
+                        extra.extend(self.by_publisher_name(settings, vendor, product, 1, newest_nvd, &mut notes));
                     }
+                    if let (1, Some(token)) = (k, settings.cvedetails_key()) {
+                        match cvedetails::by_product(&self.net, token, vendor, product, PAGE, 1) {
+                            Ok(list) => extra.extend(list),
+                            Err(e) => notes.push(format!("CVEdetails lookup failed: {e:#}")),
+                        }
+                    }
+                    let oldest = items.iter().filter_map(|a| a.published).min();
+                    let before = items.len();
+                    let keep = extra.into_iter().filter(|a| {
+                        items.iter().any(|i| i.id == a.id) || next.is_none() || matches!((a.published, oldest), (Some(p), Some(o)) if p >= o)
+                    });
+                    let merged: Vec<Advisory> = keep.collect();
+                    items = merge_all(items.into_iter().chain(merged));
+                    total += items.len() - before;
                 }
                 (total, next, items)
             }
@@ -510,6 +615,8 @@ impl Core {
             }
         }
         items.sort_by(|a, b| b.published.cmp(&a.published).then_with(|| b.id.cmp(&a.id)));
+        let mut seen = std::collections::HashSet::new();
+        notes.retain(|n| seen.insert(n.clone()));
         let listing = Listing { total, next_end, items, notes, approx };
         self.db().cache_put(&cache_key, &json!(listing))?;
         if let (None, Some(n)) = (end, nvd_total) {

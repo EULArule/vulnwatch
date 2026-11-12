@@ -85,6 +85,8 @@ export interface Settings {
   max_age_days: number;
   nvd_api_key: string;
   use_circl: boolean;
+  use_euvd: boolean;
+  cvedetails_token: string;
   use_cvelist: boolean;
   use_epss: boolean;
   ntfy: { enabled: boolean; server: string; topic: string; token: string };

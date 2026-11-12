@@ -4,6 +4,8 @@
 //! |-----------|----------------------------------|-----------------------------------------------|
 //! | `nvd`     | NVD CVE/CPE API 2.0              | product pages, live product search, alert feed |
 //! | `circl`   | CIRCL Vulnerability-Lookup       | product pages (CVE records NVD has not analysed) |
+//! | `euvd`    | ENISA EUVD                       | the same, when CIRCL is not answering         |
+//! | `cvedetails` | CVEdetails.com (needs a token) | product pages, optional                       |
 //! | `cvelist` | cve.org cvelistV5 delta          | optional faster alert feed                    |
 //! | `osv`     | OSV.dev (GHSA, PyPA, RustSec, …) | package search, package pages, package alerts |
 //! | `kev`     | CISA Known Exploited Vulns       | "exploited in the wild" flag                  |
@@ -13,8 +15,10 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 
 pub mod circl;
 pub mod cve5;
+pub mod cvedetails;
 pub mod cvelist;
 pub mod epss;
+pub mod euvd;
 pub mod kev;
 pub mod nvd;
 pub mod osv;
