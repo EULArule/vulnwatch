@@ -83,6 +83,7 @@ export interface Settings {
   background: 'periodic' | 'realtime' | 'off';
   interval_minutes: number;
   max_age_days: number;
+  lookback_days: number;
   nvd_api_key: string;
   use_circl: boolean;
   use_euvd: boolean;

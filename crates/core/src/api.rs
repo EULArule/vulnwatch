@@ -136,7 +136,10 @@ impl Core {
                 // that the full list is still worth asking for.
                 let quick = params["quick"].as_bool().unwrap_or(false);
                 let listing = if quick { self.quick_listing(&settings, &target)? } else { self.listing(&settings, &target, end, refresh)? };
+                // What is on a page the user watches belongs in their alerts too.
+                let new_alerts = if quick { 0 } else { self.alert_on_view(&settings, &target, &listing.items) };
                 Ok(json!({
+                    "new_alerts": new_alerts,
                     "partial": quick && listing.next_end == Some(usize::MAX),
                     "total": listing.total,
                     "approx": listing.approx,
@@ -226,7 +229,7 @@ impl Core {
             "alerts.delete" => {
                 let ids: Option<Vec<i64>> = arg(&params, "ids")?;
                 let db = self.db();
-                db.delete_alerts(ids.as_deref())?;
+                db.delete_alerts(ids.as_deref(), arg(&params, "sub_id")?)?;
                 Ok(json!({ "unread": db.unread_count()? }))
             }
             "alerts.since" => {
@@ -460,6 +463,11 @@ impl Core {
         let found = euvd::since(&self.net, vendor, product, from)?;
         self.db().cache_put(&key, &json!((&found.items, found.truncated)))?;
         Ok(found)
+    }
+
+    /// The newest page of a target's list (reusing a recent copy).
+    pub(crate) fn newest(&self, settings: &Settings, target: &Target) -> Result<Vec<Advisory>> {
+        Ok(self.listing(settings, target, None, false)?.items)
     }
 
     fn listing(&self, settings: &Settings, target: &Target, end: Option<usize>, refresh: bool) -> Result<Listing> {

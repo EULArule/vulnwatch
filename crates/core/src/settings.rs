@@ -42,6 +42,9 @@ pub struct Settings {
     pub interval_minutes: u32,
     /// Vulnerabilities published longer ago than this never raise a "new" alert.
     pub max_age_days: u32,
+    /// How far before its creation a subscription reaches: vulnerabilities published up to this
+    /// many days earlier still alert (0: only what is published from then on).
+    pub lookback_days: u32,
     /// Optional free NVD API key (10x rate limit).
     pub nvd_api_key: String,
     /// Merge CIRCL Vulnerability-Lookup results into product pages.
@@ -67,6 +70,7 @@ impl Default for Settings {
             background: "periodic".into(),
             interval_minutes: 15,
             max_age_days: 30,
+            lookback_days: 7,
             nvd_api_key: String::new(),
             use_circl: true,
             use_euvd: true,
@@ -85,6 +89,7 @@ impl Settings {
     pub fn sanitize(mut self) -> Self {
         self.interval_minutes = self.interval_minutes.clamp(1, 24 * 60);
         self.max_age_days = self.max_age_days.clamp(1, 365);
+        self.lookback_days = self.lookback_days.min(30);
         if !matches!(self.background.as_str(), "periodic" | "realtime" | "off") {
             self.background = "periodic".into();
         }

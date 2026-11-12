@@ -244,6 +244,15 @@
         <input class="input mono" type="password" bind:value={s.cvedetails_token} autocomplete="off" />
       </label>
       <div class="field">
+        A new subscription also alerts for what was published in the
+        <div class="seg">
+          {#each [0, 1, 3, 7, 14, 30] as d}
+            <button class:on={s.lookback_days === d} onclick={() => (s!.lookback_days = d)}>{d === 0 ? 'Nothing earlier' : d === 1 ? 'Day before' : `${d} days before`}</button>
+          {/each}
+        </div>
+        <span class="hint">How far back a subscription reaches from the day you create it. Opening or refreshing a product you watch adds what its page lists from that time to your alerts.</span>
+      </div>
+      <div class="field">
         Ignore vulnerabilities published more than
         <div class="seg">
           {#each [7, 30, 90, 365] as d}

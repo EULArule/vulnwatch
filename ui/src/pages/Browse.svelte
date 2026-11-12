@@ -2,7 +2,7 @@
   import type { AttackVector, Severity, Subscription, Target, Vuln } from '../lib/types';
   import { defaultFilter } from '../lib/types';
   import { rpc } from '../lib/api';
-  import { app, call } from '../lib/state.svelte';
+  import { app, call, refreshStatus, refreshSubs, toast } from '../lib/state.svelte';
   import { cap, pretty, sevRank } from '../lib/format';
   import Icon from '../components/Icon.svelte';
   import VulnRow from '../components/VulnRow.svelte';
@@ -75,6 +75,11 @@
       approx = !!r.approx;
       nextEnd = r.next_end;
       notes = r.notes;
+      if (r.new_alerts) {
+        toast(`${r.new_alerts} new alert${r.new_alerts === 1 ? '' : 's'} from this list`);
+        refreshStatus();
+        refreshSubs();
+      }
     } catch (e) {
       if (!current()) return;
       if (!partial) error = (e as Error).message;

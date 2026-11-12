@@ -71,9 +71,17 @@
 
   async function clearAll() {
     if (!confirm('Delete all alerts from this list? Your subscriptions stay.')) return;
-    const r = await call('alerts.delete', subId ? { ids: alerts.map((a) => a.id) } : {});
+    const r = await call('alerts.delete', { sub_id: subId });
     if (!r) return;
     await load();
+    refreshSubs();
+  }
+
+  async function remove(a: Alert) {
+    const r = await call('alerts.delete', { ids: [a.id] });
+    if (!r) return;
+    alerts = alerts.filter((x) => x.id !== a.id);
+    if (app.status) app.status.unread = r.unread;
     refreshSubs();
   }
 
@@ -135,11 +143,12 @@
     <h2 class="day">{g.day}</h2>
     <div class="card list">
       {#each g.items as a (a.id)}
-        <div class="item" onclickcapture={() => open(a)} role="presentation">
+        <div class="item" onclickcapture={(e) => !(e.target as Element).closest('.del') && open(a)} role="presentation">
           <div class="meta small">
             <a class="badge accent" href={'#/alerts/' + a.sub_id}>{a.sub_name}</a>
             {#if a.kind === 'exploited'}<span class="badge exploited">Now being exploited</span>{/if}
             <span class="muted when">{ago(a.created_at)}</span>
+            <button class="del" onclick={(e) => { e.stopPropagation(); remove(a); }} aria-label="Delete this alert" title="Delete this alert"><Icon name="x" size={16} /></button>
           </div>
           <VulnRow vuln={a.vuln} unread={!a.read} />
         </div>
@@ -186,6 +195,22 @@
   }
   .when {
     margin-left: auto;
+  }
+  .del {
+    display: grid;
+    place-items: center;
+    width: 2rem;
+    height: 2rem;
+    margin: -0.35rem -0.5rem -0.35rem 0;
+    border: 0;
+    border-radius: 50%;
+    background: none;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .del:hover {
+    background: var(--border);
+    color: var(--text);
   }
   .item :global(.vuln) {
     border-bottom: 0;

@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS alerts (
     created_at TEXT NOT NULL,
     read INTEGER NOT NULL DEFAULT 0,
     vuln TEXT NOT NULL,
+    deleted INTEGER NOT NULL DEFAULT 0,
     UNIQUE (sub_id, vuln_id, kind)
 );
 CREATE INDEX IF NOT EXISTS alerts_created ON alerts (created_at);
@@ -78,6 +79,11 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         conn.execute_batch(SCHEMA)?;
+        // Databases from before alerts could be deleted individually.
+        let has_deleted = conn.prepare("SELECT 1 FROM pragma_table_info('alerts') WHERE name = 'deleted'")?.exists([])?;
+        if !has_deleted {
+            conn.execute_batch("ALTER TABLE alerts ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")?;
+        }
         Ok(Self { conn })
     }
 
@@ -149,13 +155,15 @@ impl Store {
         self.conn.execute("DELETE FROM subscriptions WHERE id = ?1", [id])?;
         self.conn.execute("DELETE FROM alerts WHERE sub_id = ?1", [id])?;
         self.delete(&format!("osv_cursor:{id}"))?;
+        self.delete(&format!("caught_up:{id}"))?;
         Ok(())
     }
 
     // ── alerts ──────────────────────────────────────────────────────────────
 
-    /// Was an alert already recorded for this subscription and vulnerability? Returns whether any
-    /// recorded alert already said "exploited".
+    /// Was an alert already recorded for this subscription and vulnerability (deleted ones
+    /// included, so they do not come back)? Returns whether any recorded alert already said
+    /// "exploited".
     pub fn prior_alert(&self, sub_id: i64, ids: &[&str]) -> Result<Option<bool>> {
         let mut found = None;
         for id in ids {
@@ -207,7 +215,7 @@ impl Store {
         limit: u32,
     ) -> Result<Vec<Alert>> {
         let mut sql = String::from(
-            "SELECT id, sub_id, sub_name, vuln_id, kind, created_at, read, vuln FROM alerts WHERE 1=1",
+            "SELECT id, sub_id, sub_name, vuln_id, kind, created_at, read, vuln FROM alerts WHERE deleted = 0",
         );
         if let Some(s) = sub_id {
             sql.push_str(&format!(" AND sub_id = {s}"));
@@ -245,12 +253,12 @@ impl Store {
     }
 
     pub fn unread_count(&self) -> Result<i64> {
-        Ok(self.conn.query_row("SELECT COUNT(*) FROM alerts WHERE read = 0", [], |r| r.get(0))?)
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM alerts WHERE read = 0 AND deleted = 0", [], |r| r.get(0))?)
     }
 
     /// Per-subscription `(total, unread)` alert counts.
     pub fn alert_counts(&self) -> Result<std::collections::HashMap<i64, (i64, i64)>> {
-        let mut stmt = self.conn.prepare("SELECT sub_id, COUNT(*), SUM(read = 0) FROM alerts GROUP BY sub_id")?;
+        let mut stmt = self.conn.prepare("SELECT sub_id, COUNT(*), SUM(read = 0) FROM alerts WHERE deleted = 0 GROUP BY sub_id")?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -275,17 +283,27 @@ impl Store {
         Ok(())
     }
 
-    pub fn delete_alerts(&self, ids: Option<&[i64]>) -> Result<()> {
-        match ids {
-            Some(ids) => {
+    /// Remove alerts from the feed. `ids = None` means all (optionally limited to one
+    /// subscription). The rows stay behind, emptied, as a record of what the user has already
+    /// been told; without it the next check would raise the same alerts again.
+    pub fn delete_alerts(&self, ids: Option<&[i64]>, sub_id: Option<i64>) -> Result<()> {
+        const GONE: &str = "UPDATE alerts SET deleted = 1, read = 1, vuln = 'null' WHERE deleted = 0";
+        match (ids, sub_id) {
+            (Some(ids), _) => {
                 for id in ids {
-                    self.conn.execute("DELETE FROM alerts WHERE id = ?1", [id])?;
+                    self.conn.execute(&format!("{GONE} AND id = ?1"), [id])?;
                 }
             }
-            None => {
-                self.conn.execute("DELETE FROM alerts", [])?;
+            (None, Some(s)) => {
+                self.conn.execute(&format!("{GONE} AND sub_id = ?1"), [s])?;
+            }
+            (None, None) => {
+                self.conn.execute(GONE, [])?;
             }
         }
+        // Nothing that old can alert again (`max_age_days` is at most a year).
+        let cutoff = (Utc::now() - chrono::Duration::days(400)).to_rfc3339();
+        self.conn.execute("DELETE FROM alerts WHERE deleted = 1 AND created_at < ?1", [cutoff])?;
         Ok(())
     }
 

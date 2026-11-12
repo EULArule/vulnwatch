@@ -76,7 +76,10 @@ server, sharing its subscriptions and alerts, and only asks it "anything new?" i
 | [FIRST EPSS](https://www.first.org/epss/) | Probability of exploitation |
 
 Records for the same vulnerability are merged. A subscription alerts once per vulnerability, and
-once more if it later shows up as exploited. No account is needed anywhere; a free
+once more if it later shows up as exploited. A new subscription also alerts for what was
+published in the week before it was created (Settings → Sources changes how far back), and
+opening or refreshing a watched product's page adds anything recent on it that the checks have
+not reported yet. Alerts you delete do not come back. No account is needed anywhere; a free
 [NVD API key](https://nvd.nist.gov/developers/request-an-api-key) (Settings → Sources) raises
 NVD's rate limit.
 
