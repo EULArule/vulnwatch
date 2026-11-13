@@ -56,7 +56,7 @@ impl Core {
 
     pub fn settings(&self) -> Settings {
         let stored: Option<Settings> = self.db().get("settings").ok().flatten();
-        stored.unwrap_or_else(|| Settings { interval_minutes: if self.mobile { 15 } else { 5 }, ..Default::default() })
+        stored.unwrap_or_default()
     }
 
     /// Small host-owned values (e.g. the server's access token) kept alongside the data.

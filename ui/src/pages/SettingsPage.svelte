@@ -4,6 +4,7 @@
   import { app, applyTheme, call, refreshStatus, refreshSubs, signOut, toast } from '../lib/state.svelte';
   import { ago } from '../lib/format';
   import Icon from '../components/Icon.svelte';
+  import Choice from '../components/Choice.svelte';
 
   let s = $state<Settings | null>(null);
   let saved = '';
@@ -38,16 +39,12 @@
     }, 500);
   });
 
-  const intervals = $derived(
-    app.status?.mobile && s?.background !== 'realtime'
-      ? [15, 30, 60, 180, 360]
-      : [5, 15, 30, 60, 180],
-  );
+  // Android's periodic scheduler cannot run more often than every 15 minutes.
+  const shortest = $derived(app.status?.mobile && s?.background === 'periodic' ? 15 : 1);
   $effect(() => {
-    // Android's periodic scheduler cannot run more often than every 15 minutes.
-    if (s && app.status?.mobile && s.background === 'periodic' && s.interval_minutes < 15) s.interval_minutes = 15;
+    if (s && s.interval_minutes > 0 && s.interval_minutes < shortest) s.interval_minutes = shortest;
   });
-  const every = (m: number) => (m < 60 ? `${m} min` : `${m / 60} h`);
+  const every = (m: number) => (m === 0 ? 'Off' : m < 60 ? `${m} m` : `${m / 60} h`);
 
   async function test() {
     testing = true;
@@ -130,7 +127,7 @@
           <button class="btn sm primary" onclick={() => androidAsk('notifications')}>Allow</button>
         </div>
       {/if}
-      {#if android && !android.battery_exempt && s.background !== 'off'}
+      {#if android && !android.battery_exempt && s.background !== 'off' && s.interval_minutes > 0}
         <div class="warn row">
           <span class="grow"><b>Battery optimisation is on</b><br /><span class="small">Some phones stop background checks to save power. Exempting vulnwatch makes alerts reliable.</span></span>
           <button class="btn sm" onclick={() => androidAsk('battery')}>Exempt</button>
@@ -143,20 +140,14 @@
     <h2>Checking</h2>
     <div class="field">
       Check for new vulnerabilities every
-      <div class="seg">
-        {#each intervals as m}
-          <button class:on={s.interval_minutes === m} onclick={() => (s!.interval_minutes = m)}>{every(m)}</button>
-        {/each}
-      </div>
-      {#if app.status?.remote}<span class="hint">How often this phone asks your server. The server has its own interval.</span>{/if}
+      <Choice bind:value={s.interval_minutes} options={[0, 15, 30, 60, 180]} label={every} min={shortest} max={4294967295} unit="minutes" />
+      {#if s.interval_minutes === 0}
+        <span class="hint">Automatic checking is off. vulnwatch only checks when you press “Check now” on the Alerts page.</span>
+      {:else if app.status?.remote}<span class="hint">How often this phone asks your server. The server has its own interval.</span>{/if}
     </div>
     <div class="field">
       Keep alerted vulnerabilities for reading offline
-      <div class="seg">
-        {#each [0, 1, 3, 7, 14, 30, 90] as d}
-          <button class:on={s.offline_days === d} onclick={() => (s!.offline_days = d)}>{d === 0 ? 'Off' : `${d} d`}</button>
-        {/each}
-      </div>
+      <Choice bind:value={s.offline_days} options={[0, 1, 3, 7, 14, 30]} label={(d) => (d === 0 ? 'Off' : `${d} d`)} max={36500} unit="days" />
       <span class="hint">Each alert is saved with its full details for this long, so it still opens when there is no connection.</span>
     </div>
     <div class="muted small">
@@ -172,7 +163,7 @@
     {#if isApp}
       <p class="hint">This phone shows a notification for every new alert. The options below are extra channels.</p>
     {:else}
-      <p class="hint">The server checks around the clock. To be told when you are away from this page, use the Android app, ntfy, or a webhook.</p>
+      <p class="hint">{s.interval_minutes === 0 ? 'Automatic checking is off, so nothing is sent until you check by hand.' : 'The server checks around the clock.'} To be told when you are away from this page, use the Android app, ntfy, or a webhook.</p>
       {#if browserPerm === 'default'}
         <button class="btn sm start" onclick={askBrowser}><Icon name="bell" size={18} /> Also notify in this browser while it is open</button>
       {:else if browserPerm === 'granted'}
@@ -253,21 +244,13 @@
         <input class="input mono" type="password" bind:value={s.cvedetails_token} autocomplete="off" />
       </label>
       <div class="field">
-        A new subscription also alerts for what was published in the
-        <div class="seg">
-          {#each [0, 1, 3, 7, 14, 30] as d}
-            <button class:on={s.lookback_days === d} onclick={() => (s!.lookback_days = d)}>{d === 0 ? 'Nothing earlier' : d === 1 ? 'Day before' : `${d} days before`}</button>
-          {/each}
-        </div>
+        A new subscription also alerts for what was published this many days before
+        <Choice bind:value={s.lookback_days} options={[0, 1, 3, 7, 14, 30]} label={(d) => (d === 0 ? 'Off' : `${d}`)} max={36500} unit="days" />
         <span class="hint">How far back a subscription reaches from the day you create it. Opening or refreshing a product you watch adds what its page lists from that time to your alerts.</span>
       </div>
       <div class="field">
-        Ignore vulnerabilities published more than
-        <div class="seg">
-          {#each [7, 30, 90, 365] as d}
-            <button class:on={s.max_age_days === d} onclick={() => (s!.max_age_days = d)}>{d} days ago</button>
-          {/each}
-        </div>
+        Ignore vulnerabilities published more than this many days ago
+        <Choice bind:value={s.max_age_days} options={[7, 30, 90, 365]} label={(d) => `${d}`} max={36500} unit="days" />
         <span class="hint">Databases keep editing old entries; this stops those edits from alerting you. Newly exploited ones always alert.</span>
       </div>
     </section>

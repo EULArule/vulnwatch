@@ -165,6 +165,12 @@ fn poll_loop(core: &Core) {
     // Let the listener come up first; then check immediately so a restart catches up.
     thread::sleep(Duration::from_secs(2));
     loop {
+        // Automatic checking can be turned off in settings. Keep looking, so that turning it
+        // back on takes effect without a restart.
+        if core.settings().check_every().is_none() {
+            thread::sleep(Duration::from_secs(15));
+            continue;
+        }
         let started = Instant::now();
         let report = core.poll();
         if !report.alerts.is_empty() {
@@ -174,7 +180,7 @@ fn poll_loop(core: &Core) {
             log::warn!("check: {e}");
         }
         // Re-read the interval each round so a settings change applies without a restart.
-        let wait = Duration::from_secs(core.settings().interval_minutes as u64 * 60);
+        let wait = core.settings().check_every().unwrap_or_default();
         thread::sleep(wait.saturating_sub(started.elapsed()).max(Duration::from_secs(30)));
     }
 }

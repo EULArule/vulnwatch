@@ -1004,12 +1004,24 @@ mod tests {
     fn settings_round_trip_and_status() {
         let c = core();
         let mut s = c.call("settings.get", json!({})).unwrap()["settings"].clone();
-        assert_eq!(s["interval_minutes"], 5);
+        assert_eq!(s["interval_minutes"], 15);
         s["interval_minutes"] = json!(0);
         s["ntfy"]["topic"] = json!(" my-topic ");
         let saved = c.call("settings.set", json!({ "settings": s })).unwrap();
-        assert_eq!(saved["settings"]["interval_minutes"], 1);
-        assert_eq!(saved["settings"]["ntfy"]["topic"], "my-topic");
+        // 0 is a real choice: automatic checking off.
+        assert_eq!(saved["settings"]["interval_minutes"], 0);
+        assert_eq!(c.settings().check_every(), None);
+        // Custom values are taken as they are.
+        s["interval_minutes"] = json!(100_000);
+        s["max_age_days"] = json!(3000);
+        s["lookback_days"] = json!(500);
+        s["offline_days"] = json!(1000);
+        let saved = c.call("settings.set", json!({ "settings": s })).unwrap()["settings"].clone();
+        assert_eq!(saved["interval_minutes"], 100_000);
+        assert_eq!(saved["max_age_days"], 3000);
+        assert_eq!(saved["lookback_days"], 500);
+        assert_eq!(saved["offline_days"], 1000);
+        assert_eq!(saved["ntfy"]["topic"], "my-topic");
         let status = c.call("status", json!({})).unwrap();
         assert_eq!(status["version"], VERSION);
         assert_eq!(status["unread"], 0);

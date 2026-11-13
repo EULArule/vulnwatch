@@ -4355,7 +4355,7 @@ dependencies = [
 
 [[package]]
 name = "vulnwatch-app"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "jni",
  "serde_json",
@@ -4367,7 +4367,7 @@ dependencies = [
 
 [[package]]
 name = "vulnwatch-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "chrono",

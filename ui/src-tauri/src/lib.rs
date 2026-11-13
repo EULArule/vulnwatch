@@ -85,8 +85,13 @@ mod host {
     pub fn start() {
         std::thread::spawn(|| loop {
             let Ok(core) = core() else { return };
+            // Turned off in settings: keep looking, so turning it back on needs no restart.
+            if core.settings().check_every().is_none() {
+                std::thread::sleep(std::time::Duration::from_secs(15));
+                continue;
+            }
             core.poll();
-            std::thread::sleep(std::time::Duration::from_secs(u64::from(core.settings().interval_minutes.max(1)) * 60));
+            std::thread::sleep(core.settings().check_every().unwrap_or(std::time::Duration::from_secs(60)));
         });
     }
 }
@@ -198,7 +203,9 @@ mod host {
         let out = catch_unwind(|| match core() {
             Ok(core) => {
                 let s = core.settings();
-                json!({ "background": s.background, "interval_minutes": s.interval_minutes })
+                // Checking turned off altogether is, to the scheduler, background mode "off".
+                let background = if s.interval_minutes == 0 { "off" } else { s.background.as_str() };
+                json!({ "background": background, "interval_minutes": s.interval_minutes })
             }
             Err(_) => json!({ "background": "periodic", "interval_minutes": 15 }),
         })

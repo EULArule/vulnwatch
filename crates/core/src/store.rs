@@ -311,9 +311,8 @@ impl Store {
                 self.conn.execute(GONE, [])?;
             }
         }
-        // Nothing that old can alert again (`max_age_days` is at most a year).
-        let cutoff = (Utc::now() - chrono::Duration::days(400)).to_rfc3339();
-        self.conn.execute("DELETE FROM alerts WHERE deleted = 1 AND created_at < ?1", [cutoff])?;
+        // The emptied rows stay for good: they are what stops a dismissed vulnerability from
+        // alerting again, however far back `max_age_days` is set to reach.
         Ok(())
     }
 

@@ -38,7 +38,8 @@ pub struct Remote {
 pub struct Settings {
     /// Android background mode: "periodic" (WorkManager), "realtime" (foreground service), "off".
     pub background: String,
-    /// Minutes between checks. Android's periodic mode cannot go below 15.
+    /// Minutes between checks; 0 turns automatic checking off, leaving only "Check now".
+    /// Android's periodic mode cannot go below 15.
     pub interval_minutes: u32,
     /// Vulnerabilities published longer ago than this never raise a "new" alert.
     pub max_age_days: u32,
@@ -89,11 +90,18 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// How long to wait between automatic checks, or `None` when they are turned off.
+    pub fn check_every(&self) -> Option<std::time::Duration> {
+        (self.interval_minutes > 0).then(|| std::time::Duration::from_secs(u64::from(self.interval_minutes) * 60))
+    }
+
     pub fn sanitize(mut self) -> Self {
-        self.interval_minutes = self.interval_minutes.clamp(1, 24 * 60);
-        self.max_age_days = self.max_age_days.clamp(1, 365);
-        self.lookback_days = self.lookback_days.min(30);
-        self.offline_days = self.offline_days.min(365);
+        // No upper limits of taste: any interval goes. Day counts stop at a century, which is
+        // older than any CVE and only there so that date arithmetic cannot overflow.
+        const CENTURY: u32 = 36_500;
+        self.max_age_days = self.max_age_days.clamp(1, CENTURY);
+        self.lookback_days = self.lookback_days.min(CENTURY);
+        self.offline_days = self.offline_days.min(CENTURY);
         if !matches!(self.background.as_str(), "periodic" | "realtime" | "off") {
             self.background = "periodic".into();
         }
