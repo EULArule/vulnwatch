@@ -2,7 +2,10 @@
   import type { Vuln } from '../lib/types';
   import { cap, date, pct, score } from '../lib/format';
 
+  import { remember } from '../lib/seen';
+
   let { vuln, unread = false }: { vuln: Vuln; unread?: boolean } = $props();
+  $effect(() => remember(vuln));
 </script>
 
 <a class="vuln" class:unread href={'#/cve/' + encodeURIComponent(vuln.id)}>

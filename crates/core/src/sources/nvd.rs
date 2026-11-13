@@ -18,6 +18,7 @@ use crate::net::{status_of, Net};
 const CVES: &str = "https://services.nvd.nist.gov/rest/json/cves/2.0";
 const CPES: &str = "https://services.nvd.nist.gov/rest/json/cpes/2.0";
 const CISA_ADP: &str = "134c704f-9b21-4f2e-91b3-4a467353bcc0";
+const MIRROR: &str = "https://raw.githubusercontent.com/fkie-cad/nvd-json-data-feeds/main";
 pub const PAGE_MAX: usize = 2000;
 
 pub struct Page {
@@ -132,6 +133,25 @@ pub fn latest(net: &Net, key: Option<&str>, end: Option<usize>, count: usize, hi
 
 pub fn by_id(net: &Net, key: Option<&str>, id: &str) -> Result<Option<Advisory>> {
     Ok(cves(net, key, &[("cveId", id)], 0, 1)?.items.into_iter().next())
+}
+
+/// Where the mirror keeps a CVE: `CVE-2021/CVE-2021-31xx/CVE-2021-3156.json`.
+fn mirror_url(id: &str) -> Option<String> {
+    let (year, number) = id.strip_prefix("CVE-")?.split_once('-')?;
+    let ok = year.len() == 4 && number.len() >= 4 && year.chars().chain(number.chars()).all(|c| c.is_ascii_digit());
+    ok.then(|| format!("{MIRROR}/CVE-{year}/CVE-{year}-{}xx/{id}.json", &number[..number.len() - 2]))
+}
+
+/// One CVE from the mirror of NVD's records that Fraunhofer FKIE keeps on GitHub: the same
+/// record the API gives, synced every two hours, and answered in a fraction of a second where
+/// NVD itself takes eight or nine without an API key. `None` if it is not there (yet).
+pub fn by_id_mirrored(net: &Net, id: &str) -> Result<Option<Advisory>> {
+    let Some(url) = mirror_url(id) else { return Ok(None) };
+    match net.get_json(&url, &[], &[]) {
+        Ok(v) => Ok(parse_cve(&v)),
+        Err(e) if status_of(&e) == Some(404) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Every CVE added or changed in the window (the alert firehose). Windows over 120 days are rejected by NVD.
@@ -350,6 +370,14 @@ mod tests {
         assert!(a.best_score().is_some());
         assert!(a.effective_severity().unwrap() >= Severity::Low);
         assert!(!a.exploited);
+    }
+
+    #[test]
+    fn finds_a_cve_in_the_mirror() {
+        assert_eq!(mirror_url("CVE-2021-3156").unwrap(), format!("{MIRROR}/CVE-2021/CVE-2021-31xx/CVE-2021-3156.json"));
+        assert!(mirror_url("CVE-2026-124952").unwrap().ends_with("/CVE-2026/CVE-2026-1249xx/CVE-2026-124952.json"));
+        assert!(mirror_url("CVE-2021-../x").is_none());
+        assert!(mirror_url("GHSA-462w-v97r-4m45").is_none());
     }
 
     #[test]

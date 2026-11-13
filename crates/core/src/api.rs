@@ -13,7 +13,7 @@ use crate::matcher::{cpe_vendor_product, suggest_keywords, Compiled, Filter, Sub
 use crate::model::{merge_all, Advisory};
 use crate::notify::{self, Notification};
 use crate::settings::Settings;
-use crate::sources::{circl, cve5, cvedetails, euvd, nvd, osv};
+use crate::sources::{circl, cve5, cvedetails, epss, euvd, nvd, osv};
 use crate::{catalog, Core, VERSION};
 
 /// Vulnerabilities per page on product pages.
@@ -151,7 +151,17 @@ impl Core {
             "vulns.get" => {
                 let id = text(&params, "id")?;
                 let id = looks_like_vuln_id(&id).unwrap_or(id);
-                Ok(self.advisory(&settings, &id, params["refresh"].as_bool().unwrap_or(false))?.view(true))
+                let refresh = params["refresh"].as_bool().unwrap_or(false);
+                // With `part`, load just that source and answer with the record as it stands,
+                // so the page can ask for all of them at once and fill in as each one lands.
+                match params["part"].as_str() {
+                    Some(part) => {
+                        self.load_part(&settings, &id, part, refresh)?;
+                        let (adv, seq) = self.assemble(&id)?;
+                        Ok(json!({ "vuln": adv.map(|a| a.view(true)), "seq": seq }))
+                    }
+                    None => Ok(self.advisory(&settings, &id, refresh)?.view(true)),
+                }
             }
             "subs.list" => {
                 let db = self.db();
@@ -633,47 +643,118 @@ impl Core {
         Ok(listing)
     }
 
-    /// Full detail for one vulnerability, merged from every source that knows it.
+    /// Full detail for one vulnerability, merged from every source that knows it. The sources
+    /// are asked at the same time, so this takes as long as the slowest of them.
     fn advisory(&self, settings: &Settings, id: &str, refresh: bool) -> Result<Advisory> {
-        let cache_key = format!("vuln:{id}");
-        if !refresh {
-            if let Some(hit) = self.db().cache_get(&cache_key, CACHE_SECS)?.and_then(|v| serde_json::from_value(v).ok()) {
-                return Ok(hit);
-            }
+        let results: Vec<Result<()>> = std::thread::scope(|s| {
+            let jobs: Vec<_> = vuln_parts(id).iter().map(|part| s.spawn(move || self.load_part(settings, id, part, refresh))).collect();
+            jobs.into_iter().map(|j| j.join().unwrap_or_else(|_| Err(anyhow!("a lookup crashed")))).collect()
+        });
+        if let Some(adv) = self.assemble(id)?.0 {
+            return Ok(adv);
         }
-        let mut found: Vec<Advisory> = vec![];
-        let mut failure = None;
-        if id.starts_with("CVE-") {
-            match nvd::by_id(&self.net, settings.nvd_key(), id) {
-                Ok(a) => found.extend(a),
-                Err(e) => failure = Some(e),
+        match results.into_iter().find_map(Result::err) {
+            Some(e) => Err(e).context(format!("could not load {id}")),
+            None => Err(anyhow!("{id} was not found")),
+        }
+    }
+
+    /// Fetch one source's share of a vulnerability into the cache (a no-op while it is fresh).
+    /// A source that does not know the id is not an error: its share is recorded as empty.
+    fn load_part(&self, settings: &Settings, id: &str, part: &str, refresh: bool) -> Result<()> {
+        if part == "kev" {
+            // Keeps its own copy and its own idea of fresh.
+            return self.refresh_kev(false).map(|_| ()).context("CISA KEV");
+        }
+        let key = part_key(id, part);
+        if !refresh && self.db().cache_get(&key, CACHE_SECS)?.is_some() {
+            return Ok(());
+        }
+        let absent = |r: Result<Option<Advisory>>| match r {
+            Err(e) if crate::net::status_of(&e) == Some(404) => Ok(None),
+            other => other,
+        };
+        let body = match part {
+            "nvd" => {
+                // The mirror first: it can be two hours behind, but NVD itself keeps anyone
+                // without an API key waiting eight or nine seconds. A refresh asks NVD.
+                let quick = if refresh { None } else { nvd::by_id_mirrored(&self.net, id).ok().flatten() };
+                match quick {
+                    Some(record) => json!({ "record": record }),
+                    None => json!({ "record": nvd::by_id(&self.net, settings.nvd_key(), id)? }),
+                }
             }
             // The CVE record itself: has the vendor's own product names, fix versions and score,
             // and exists before NVD has processed the CVE.
-            match self.net.get_json(&format!("https://cveawg.mitre.org/api/cve/{id}"), &[], &[]) {
-                Ok(v) => found.extend(cve5::parse(&v)),
-                Err(e) if found.is_empty() => failure = Some(e),
-                Err(_) => {}
+            "cve.org" => {
+                let record = self.net.get_json(&format!("https://cveawg.mitre.org/api/cve/{id}"), &[], &[]).map(|v| cve5::parse(&v));
+                json!({ "record": absent(record)? })
             }
-        } else {
-            match osv::by_id(&self.net, id) {
-                Ok(a) => found.extend(a),
-                Err(e) => failure = Some(e),
+            "osv" => {
+                let record = absent(osv::by_id(&self.net, id))?;
+                // Its CVE number is only known now, so the EPSS lookup rides along.
+                if let Some(cve) = record.as_ref().and_then(|a| a.cve_id()).filter(|_| settings.use_epss) {
+                    if let Ok(found) = self.epss_part(cve) {
+                        self.db().cache_put(&part_key(id, "epss"), &found)?;
+                    }
+                }
+                json!({ "record": record })
             }
-        }
-        let Some(mut adv) = merge_all(found).into_iter().next() else {
-            return match failure {
-                Some(e) if crate::net::status_of(&e) != Some(404) => Err(e).context(format!("could not load {id}")),
-                _ => Err(anyhow!("{id} was not found")),
-            };
+            "epss" if settings.use_epss => self.epss_part(id).context("EPSS")?,
+            "epss" => json!({}),
+            _ => bail!("unknown part `{part}`"),
         };
-        flag_kev(&mut adv, &self.kev_ready());
-        if settings.use_epss {
-            self.add_epss(&mut [&mut adv]).ok();
-        }
-        self.db().cache_put(&cache_key, &json!(adv))?;
-        Ok(adv)
+        self.db().cache_put(&key, &body)
     }
+
+    fn epss_part(&self, cve: &str) -> Result<Value> {
+        let scores = epss::lookup(&self.net, &[cve.to_string()])?;
+        Ok(match scores.get(cve) {
+            Some((p, pct)) => json!({ "epss": p, "percentile": pct }),
+            None => json!({}),
+        })
+    }
+
+    /// The vulnerability as the parts loaded so far describe it (`None` until one of them has a
+    /// record), with a number that grows with every call: a later answer is never behind an
+    /// earlier one, so whoever asked for several parts at once keeps the highest.
+    fn assemble(&self, id: &str) -> Result<(Option<Advisory>, u64)> {
+        let mut seq = self.assembled.lock().unwrap_or_else(|p| p.into_inner());
+        *seq += 1;
+        let mut records = vec![];
+        let mut epss = Value::Null;
+        {
+            let db = self.db();
+            for part in ["nvd", "cve.org", "osv", "epss"] {
+                let Some(mut body) = db.cache_get(&part_key(id, part), CACHE_SECS)? else { continue };
+                match part {
+                    "epss" => epss = body,
+                    _ => records.extend(serde_json::from_value::<Option<Advisory>>(body["record"].take()).ok().flatten()),
+                }
+            }
+        }
+        let Some(mut adv) = merge_all(records).into_iter().next() else { return Ok((None, *seq)) };
+        flag_kev(&mut adv, &self.kev());
+        if let Some(p) = epss["epss"].as_f64() {
+            adv.epss = Some(p as f32);
+            adv.epss_percentile = epss["percentile"].as_f64().map(|x| x as f32);
+        }
+        Ok((Some(adv), *seq))
+    }
+}
+
+/// What a vulnerability page is put together from. Each is fetched and cached on its own, so a
+/// slow or failing upstream holds back only its own share.
+fn vuln_parts(id: &str) -> &'static [&'static str] {
+    if id.starts_with("CVE-") {
+        &["nvd", "cve.org", "kev", "epss"]
+    } else {
+        &["osv", "kev"]
+    }
+}
+
+fn part_key(id: &str, part: &str) -> String {
+    format!("vuln:{id}:{part}")
 }
 
 fn default_name(target: &Target) -> String {
@@ -755,6 +836,37 @@ mod tests {
         assert_eq!(looks_like_vuln_id("openssl"), None);
         assert_eq!(looks_like_vuln_id("cve-2024"), None);
         assert_eq!(looks_like_vuln_id("go lang"), None);
+    }
+
+    #[test]
+    fn a_vulnerability_fills_in_part_by_part() {
+        let core = core();
+        let id = "CVE-2026-4897";
+        let (none, first) = core.assemble(id).unwrap();
+        assert!(none.is_none());
+
+        let v: Value = serde_json::from_str(include_str!("../testdata/nvd-cve.json")).unwrap();
+        let record = nvd::parse_cve(&v).unwrap();
+        assert_eq!(record.id, id);
+        core.db().cache_put(&part_key(id, "nvd"), &json!({ "record": record })).unwrap();
+        // A source that had nothing, and one that answered after the record was shown.
+        core.db().cache_put(&part_key(id, "cve.org"), &json!({ "record": null })).unwrap();
+        let (adv, second) = core.assemble(id).unwrap();
+        assert!(second > first);
+        assert_eq!(adv.unwrap().epss, None);
+
+        core.db().cache_put(&part_key(id, "epss"), &json!({ "epss": 0.25, "percentile": 0.9 })).unwrap();
+        let (adv, third) = core.assemble(id).unwrap();
+        assert!(third > second);
+        let adv = adv.unwrap();
+        assert_eq!((adv.epss, adv.epss_percentile), (Some(0.25), Some(0.9)));
+        assert_eq!(adv.sources, ["nvd"]);
+
+        // Cached parts are not fetched again, so this needs no network.
+        let settings = core.settings();
+        core.load_part(&settings, id, "nvd", false).unwrap();
+        assert!(core.load_part(&settings, id, "nonsense", false).is_err());
+        assert_eq!(vuln_parts("GHSA-462w-v97r-4m45"), ["osv", "kev"]);
     }
 
     #[test]

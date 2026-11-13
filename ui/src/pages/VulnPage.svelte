@@ -2,27 +2,56 @@
   import type { Vuln } from '../lib/types';
   import { openExternal, rpc } from '../lib/api';
   import { cap, date, pct, score } from '../lib/format';
+  import { recall, remember } from '../lib/seen';
   import Icon from '../components/Icon.svelte';
 
   let { id }: { id: string } = $props();
 
   let v: Vuln | null = $state(null);
   let error = $state('');
-  let loading = $state(true);
+  /** Sources that have not answered yet. */
+  let pending: string[] = $state([]);
+  let run = 0;
 
+  const partNames: Record<string, string> = { nvd: 'NVD', 'cve.org': 'CVE.org', osv: 'OSV', kev: 'CISA KEV', epss: 'EPSS' };
+  /** The parts that carry the record itself; the others only add to it. */
+  const records = ['nvd', 'cve.org', 'osv'];
+  const awaiting = (...parts: string[]) => parts.some((p) => pending.includes(p));
+
+  // Every source is asked at once and the page fills in as each answers, so a slow one (NVD can
+  // take half a minute) only holds back what it alone knows.
   async function load(refresh = false) {
-    loading = true;
+    const mine = ++run;
+    const parts = id.toUpperCase().startsWith('CVE-') ? ['cve.org', 'nvd', 'kev', 'epss'] : ['osv', 'kev'];
+    pending = parts;
     error = '';
-    try {
-      v = await rpc('vulns.get', { id, refresh });
-    } catch (e) {
-      error = (e as Error).message;
-    }
-    loading = false;
+    let newest = -1;
+    let failure = '';
+    await Promise.all(
+      parts.map(async (part) => {
+        try {
+          const r = await rpc('vulns.get', { id, refresh, part });
+          if (mine !== run) return;
+          // A paired server from before parts existed answers with the whole record.
+          const whole = r?.seq === undefined;
+          const seq: number = whole ? Infinity : r.seq;
+          const vuln: Vuln | null = whole ? r : r.vuln;
+          // Answers can arrive out of order; `seq` says which one has seen the most.
+          if (vuln && seq >= newest) {
+            newest = seq;
+            v = vuln;
+            remember(vuln);
+          }
+        } catch (e) {
+          if (mine === run && records.includes(part)) failure ||= (e as Error).message;
+        }
+        if (mine === run) pending = pending.filter((p) => p !== part);
+      }),
+    );
+    if (mine === run && newest < 0) error = failure || `${id} was not found`;
   }
   $effect(() => {
-    id;
-    v = null;
+    v = recall(id);
     load();
   });
 
@@ -60,7 +89,7 @@
       out.push({ name: 'CIRCL Vulnerability-Lookup', note: used('circl'), url: `https://vulnerability.circl.lu/vuln/${cve}` });
       const euvd = ids.find((i) => i.startsWith('EUVD-'));
       if (euvd) out.push({ name: 'ENISA EUVD', note: used('euvd'), url: `https://euvd.enisa.europa.eu/vulnerability/${euvd}` });
-      if (has('cvedetails')) out.push({ name: 'CVEdetails', note: used('cvedetails'), url: `https://www.cvedetails.com/cve/${cve}/` });
+      out.push({ name: 'CVEdetails', note: used('cvedetails'), url: `https://www.cvedetails.com/cve/${cve}/` });
       if (v.exploited) out.push({ name: 'CISA Known Exploited', note: 'listed as exploited', url: `https://www.cisa.gov/known-exploited-vulnerabilities-catalog?search_api_fulltext=${cve}` });
       out.push({ name: 'EPSS', note: 'exploit likelihood', url: `https://api.first.org/data/v1/epss?cve=${cve}` });
     }
@@ -78,18 +107,23 @@
     <h1 class="mono">{v?.id ?? id}</h1>
     {#if v?.aliases?.length}<div class="muted small">Also known as {v.aliases.join(', ')}</div>{/if}
   </div>
-  <button class="btn ghost sm" onclick={() => load(true)} aria-label="Refresh" title="Refresh"><Icon name="refresh" /></button>
+  <button class="btn ghost sm" onclick={() => load(true)} disabled={pending.length > 0} aria-label="Refresh" title="Refresh">
+    {#if pending.length}<span class="spinner"></span>{:else}<Icon name="refresh" />{/if}
+  </button>
 </header>
 
-{#if loading}
+{#if !v && pending.length}
   <div class="loading"><span class="spinner"></span> Loading…</div>
-{:else if error || !v}
+{:else if !v}
   <div class="card empty">
     <h2>Could not load {id}</h2>
     <p>{error}</p>
     <p style="margin-top:1rem"><button class="btn" onclick={() => load(true)}><Icon name="refresh" /> Try again</button></p>
   </div>
 {:else}
+  {#if error}
+    <div class="card pad note small">Showing what was already known. The full record could not be loaded: {error}</div>
+  {/if}
   {#if v.exploited}
     <div class="alert">
       <Icon name="flame" size={22} />
@@ -101,20 +135,20 @@
     <div class="card fact sev-{v.severity ?? 'none'}">
       <span class="k">Severity</span>
       <b class="big">{score(v)}</b>
-      <span>{v.severity ? cap(v.severity) : 'Not scored yet'}</span>
+      <span>{v.severity ? cap(v.severity) : awaiting(...records) ? 'Checking…' : 'Not scored yet'}</span>
     </div>
     <div class="card fact">
       <span class="k">Attack</span>
-      <b>{v.attack_vector ? vectorWords[v.attack_vector] : 'Unknown'}</b>
+      <b>{v.attack_vector ? vectorWords[v.attack_vector] : awaiting(...records) ? 'Checking…' : 'Unknown'}</b>
     </div>
     <div class="card fact">
       <span class="k">Chance of exploitation</span>
       <b class="big">{v.epss != null ? pct(v.epss) : '–'}</b>
-      <span class="small">{v.epss != null ? `in 30 days (EPSS), higher than ${pct(v.epss_percentile)} of CVEs` : 'No EPSS estimate yet'}</span>
+      <span class="small">{v.epss != null ? `in 30 days (EPSS), higher than ${pct(v.epss_percentile)} of CVEs` : awaiting('epss', 'osv') ? 'Checking…' : 'No EPSS estimate yet'}</span>
     </div>
     <div class="card fact">
       <span class="k">Fix</span>
-      <b>{v.fixed_in.length ? v.fixed_in.slice(0, 4).join(', ') : 'Not stated'}</b>
+      <b>{v.fixed_in.length ? v.fixed_in.slice(0, 4).join(', ') : awaiting(...records) ? 'Checking…' : 'Not stated'}</b>
       {#if v.fixed_in.length}<span class="small">Update to this version or later</span>{/if}
     </div>
   </div>
@@ -126,6 +160,7 @@
       Published {date(v.published) || 'unknown'}{v.modified ? ` · updated ${date(v.modified)}` : ''}
       {#if v.status} · {v.status}{/if}
       · sources: {v.sources.join(', ')}
+      {#if pending.length} · still checking {pending.map((p) => partNames[p] ?? p).join(', ')}…{/if}
     </div>
   </section>
 
@@ -191,6 +226,10 @@
     background: var(--crit-bg);
     color: var(--crit);
     margin-bottom: 0.8rem;
+  }
+  .note {
+    margin-bottom: 0.8rem;
+    color: var(--muted);
   }
   .facts {
     display: grid;

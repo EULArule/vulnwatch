@@ -35,6 +35,8 @@ pub struct Core {
     /// Running inside the mobile app (changes a few defaults and what the UI offers).
     pub mobile: bool,
     kev: Mutex<Option<Arc<BTreeMap<String, String>>>>,
+    /// Counts `assemble` calls (and keeps them one at a time); see there.
+    assembled: Mutex<u64>,
 }
 
 impl Core {
@@ -44,7 +46,7 @@ impl Core {
     }
 
     pub fn with_store(store: Store, mobile: bool) -> Self {
-        Self { store: Mutex::new(store), net: Net::new(), poll_lock: Mutex::new(()), mobile, kev: Mutex::new(None) }
+        Self { store: Mutex::new(store), net: Net::new(), poll_lock: Mutex::new(()), mobile, kev: Mutex::new(None), assembled: Mutex::new(0) }
     }
 
     pub(crate) fn db(&self) -> MutexGuard<'_, Store> {

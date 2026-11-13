@@ -10,7 +10,23 @@
   let alerts: Alert[] = $state([]);
   let more = $state(false);
   let loading = $state(true);
-  let unreadOnly = $state(false);
+  const FILTER_KEY = 'vulnwatch.alerts.unreadOnly';
+  function stored() {
+    try {
+      return localStorage.getItem(FILTER_KEY) === '1';
+    } catch {
+      return false;
+    }
+  }
+  let unreadOnly = $state(stored());
+  function setUnreadOnly(on: boolean) {
+    unreadOnly = on;
+    try {
+      localStorage.setItem(FILTER_KEY, on ? '1' : '0');
+    } catch {
+      /* the choice just won't be remembered */
+    }
+  }
   let checking = $state(false);
 
   const sub = $derived(subId ? app.subs.find((s) => s.id === subId) : null);
@@ -117,8 +133,8 @@
 
 <div class="row wrap bar">
   <div class="chips grow">
-    <button class="chip" class:on={!unreadOnly} onclick={() => (unreadOnly = false)}>All</button>
-    <button class="chip" class:on={unreadOnly} onclick={() => (unreadOnly = true)}>Unread{app.status?.unread ? ` (${app.status.unread})` : ''}</button>
+    <button class="chip" class:on={!unreadOnly} onclick={() => setUnreadOnly(false)}>All</button>
+    <button class="chip" class:on={unreadOnly} onclick={() => setUnreadOnly(true)}>Unread{app.status?.unread ? ` (${app.status.unread})` : ''}</button>
     {#if subId}<a class="chip" href="#/alerts"><Icon name="x" size={16} /> {sub?.name ?? 'Filter'}</a>{/if}
   </div>
   {#if hasUnread}<button class="btn ghost sm" onclick={markAll}><Icon name="check" size={18} /> Mark all read</button>{/if}
