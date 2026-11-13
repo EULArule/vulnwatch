@@ -84,6 +84,7 @@ export interface Settings {
   interval_minutes: number;
   max_age_days: number;
   lookback_days: number;
+  offline_days: number;
   nvd_api_key: string;
   use_circl: boolean;
   use_euvd: boolean;
@@ -110,6 +111,16 @@ export interface Status {
   last_errors?: string[];
   last_new?: number;
   server_version?: string;
+  /** A check is running right now. */
+  checking?: boolean;
+}
+
+/** One thing a check waits for, usually one source. */
+export interface CheckStep {
+  name: string;
+  state: 'running' | 'done' | 'failed';
+  ms: number;
+  error?: string | null;
 }
 
 export const defaultFilter = (): Filter => ({

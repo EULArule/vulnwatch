@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Vuln } from '../lib/types';
   import { openExternal, rpc } from '../lib/api';
-  import { cap, date, pct, score } from '../lib/format';
+  import { ago, cap, date, pct, score } from '../lib/format';
   import { recall, remember } from '../lib/seen';
   import Icon from '../components/Icon.svelte';
 
@@ -11,6 +11,8 @@
   let error = $state('');
   /** Sources that have not answered yet. */
   let pending: string[] = $state([]);
+  /** When what is shown is the copy kept for offline reading: the time it was saved (Unix seconds). */
+  let keptAt: number | null = $state(null);
   let run = 0;
 
   const partNames: Record<string, string> = { nvd: 'NVD', 'cve.org': 'CVE.org', osv: 'OSV', kev: 'CISA KEV', epss: 'EPSS' };
@@ -25,6 +27,7 @@
     const parts = id.toUpperCase().startsWith('CVE-') ? ['cve.org', 'nvd', 'kev', 'epss'] : ['osv', 'kev'];
     pending = parts;
     error = '';
+    keptAt = null;
     let newest = -1;
     let failure = '';
     await Promise.all(
@@ -40,6 +43,7 @@
           if (vuln && seq >= newest) {
             newest = seq;
             v = vuln;
+            keptAt = (whole ? r.kept_at : r?.kept_at) ?? null;
             remember(vuln);
           }
         } catch (e) {
@@ -121,6 +125,9 @@
     <p style="margin-top:1rem"><button class="btn" onclick={() => load(true)}><Icon name="refresh" /> Try again</button></p>
   </div>
 {:else}
+  {#if keptAt}
+    <div class="card pad note small">{pending.length ? 'Showing' : 'No connection: this is'} the copy saved {ago(new Date(keptAt * 1000).toISOString())}.</div>
+  {/if}
   {#if error}
     <div class="card pad note small">Showing what was already known. The full record could not be loaded: {error}</div>
   {/if}

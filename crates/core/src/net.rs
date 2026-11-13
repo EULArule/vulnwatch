@@ -33,11 +33,34 @@ fn convert(url: &str, e: ureq::Error) -> anyhow::Error {
     match e {
         ureq::Error::Status(code, _) => HttpStatus(code, host(url)).into(),
         // Not `t` itself: its text repeats the whole URL, query string and all.
-        ureq::Error::Transport(t) => match t.message() {
-            Some(m) => anyhow!("{}: {} ({})", host(url), t.kind(), m),
-            None => anyhow!("{}: {}", host(url), t.kind()),
-        },
+        ureq::Error::Transport(t) => {
+            let offline = matches!(t.kind(), ureq::ErrorKind::Dns | ureq::ErrorKind::ConnectionFailed);
+            let e = match t.message() {
+                Some(m) => anyhow!("{}: {} ({})", host(url), t.kind(), m),
+                None => anyhow!("{}: {}", host(url), t.kind()),
+            };
+            if offline {
+                e.context(NoConnection)
+            } else {
+                e
+            }
+        }
     }
+}
+
+/// Marks an error as "the host could not even be connected to": most likely there is no network.
+#[derive(Debug)]
+struct NoConnection;
+
+impl std::fmt::Display for NoConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no connection")
+    }
+}
+
+/// Whether a request failed before reaching the host. Trying again at once is pointless then.
+pub fn no_connection(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<NoConnection>().is_some()
 }
 
 impl Default for Net {

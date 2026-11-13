@@ -73,6 +73,16 @@ pub fn looks_like_vuln_id(q: &str) -> Option<String> {
     (PREFIXES.iter().any(|p| upper.starts_with(p)) && q.len() > 6 && !q.contains(' ')).then_some(upper)
 }
 
+/// Marks an error as "the paired server did not answer", as opposed to the server saying no.
+#[derive(Debug)]
+struct Unreachable;
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("could not reach the vulnwatch server")
+    }
+}
+
 impl Core {
     /// Dispatch one API call.
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
@@ -80,7 +90,7 @@ impl Core {
         if settings.remote.enabled && self.mobile {
             match method {
                 // Device-local state.
-                "settings.get" | "settings.set" | "poll" | "remote.test" | "search" => {}
+                "settings.get" | "settings.set" | "poll" | "poll.progress" | "remote.test" | "search" => {}
                 "status" => {
                     let mut local = self.status(&settings);
                     match self.remote_call(&settings, "status", json!({})) {
@@ -94,6 +104,7 @@ impl Core {
                     }
                     return Ok(local);
                 }
+                "vulns.get" | "alerts.list" => return self.remote_or_kept(&settings, method, params),
                 _ => return self.remote_call(&settings, method, params),
             }
         }
@@ -156,11 +167,40 @@ impl Core {
                 // so the page can ask for all of them at once and fill in as each one lands.
                 match params["part"].as_str() {
                     Some(part) => {
-                        self.load_part(&settings, &id, part, refresh)?;
+                        let loaded = self.load_part(&settings, &id, part, refresh);
                         let (adv, seq) = self.assemble(&id)?;
-                        Ok(json!({ "vuln": adv.map(|a| a.view(true)), "seq": seq }))
+                        let view = adv.map(|a| a.view(true));
+                        match (loaded, view) {
+                            (Ok(()), view) => {
+                                // Half a record must not replace the kept copy: wait for every source.
+                                if let Some(v) = view.as_ref().filter(|_| self.all_parts_loaded(&id)) {
+                                    self.db().offline_refresh(&id, v)?;
+                                }
+                                Ok(json!({ "vuln": view, "seq": seq }))
+                            }
+                            // Nothing could be loaded: answer with the copy kept when it raised an
+                            // alert. `seq` 0 lets any source that does answer take its place.
+                            (Err(e), None) => match self.db().offline_vuln(&id)? {
+                                Some((at, vuln)) => Ok(json!({ "vuln": vuln, "seq": 0, "kept_at": at })),
+                                None => Err(e),
+                            },
+                            (Err(e), Some(_)) => Err(e),
+                        }
                     }
-                    None => Ok(self.advisory(&settings, &id, refresh)?.view(true)),
+                    None => match self.advisory(&settings, &id, refresh) {
+                        Ok(adv) => {
+                            let view = adv.view(true);
+                            self.db().offline_refresh(&id, &view)?;
+                            Ok(view)
+                        }
+                        Err(e) => match self.db().offline_vuln(&id)? {
+                            Some((at, mut vuln)) => {
+                                vuln["kept_at"] = json!(at);
+                                Ok(vuln)
+                            }
+                            None => Err(e),
+                        },
+                    },
                 }
             }
             "subs.list" => {
@@ -272,7 +312,12 @@ impl Core {
                 {
                     db.cache_clear()?;
                 }
+                db.offline_purge(new.offline_days)?;
                 db.set("settings", &new)?;
+                drop(db);
+                if new.offline_days > settings.offline_days {
+                    self.keep_recent_alerts(new.offline_days)?;
+                }
                 Ok(json!({ "settings": new }))
             }
             "remote.test" => {
@@ -295,6 +340,7 @@ impl Core {
                     "notifications": report.notifications,
                 }))
             }
+            "poll.progress" => Ok(self.check_progress()),
             "notify.test" => {
                 let n = Notification {
                     id: 0,
@@ -326,6 +372,7 @@ impl Core {
         v["interval_minutes"] = json!(settings.interval_minutes);
         v["background"] = json!(settings.background);
         v["nvd_key"] = json!(settings.nvd_key().is_some());
+        v["checking"] = json!(self.checking());
         v["now"] = json!(Utc::now());
         v
     }
@@ -342,12 +389,58 @@ impl Core {
             .post_json(&format!("{url}/api/rpc"), &[("Authorization", auth.as_str())], &json!({ "method": method, "params": params }))
             .map_err(|e| match crate::net::status_of(&e) {
                 Some(401 | 403) => anyhow!("the server rejected the access token"),
-                _ => e.context("could not reach the vulnwatch server"),
+                _ => e.context(Unreachable),
             })?;
         if let Some(err) = reply["error"].as_str() {
             bail!("{err}");
         }
         Ok(reply["result"].clone())
+    }
+
+    /// A paired app's call to its server; when the server cannot be reached, answered from what
+    /// is kept on the device for that: the alerts of the last days and their vulnerabilities.
+    fn remote_or_kept(&self, settings: &Settings, method: &str, params: Value) -> Result<Value> {
+        let keep = settings.offline_days > 0;
+        let e = match self.remote_call(settings, method, params.clone()) {
+            Ok(v) => {
+                if keep && method == "alerts.list" {
+                    let horizon = Utc::now() - chrono::Duration::days(settings.offline_days as i64);
+                    let alerts: Vec<crate::store::Alert> = serde_json::from_value(v["alerts"].clone()).unwrap_or_default();
+                    let recent: Vec<_> = alerts.into_iter().filter(|a| a.created_at >= horizon).collect();
+                    self.db().offline_put_all(&recent).ok();
+                }
+                return Ok(v);
+            }
+            Err(e) if keep && e.downcast_ref::<Unreachable>().is_some() => e,
+            Err(e) => return Err(e),
+        };
+        let db = self.db();
+        match method {
+            "alerts.list" => {
+                // The kept alerts are few: they are all the first page.
+                let alerts = if params["before_id"].is_null() {
+                    db.offline_alerts(arg(&params, "sub_id")?, params["unread_only"].as_bool().unwrap_or(false))?
+                } else {
+                    vec![]
+                };
+                let unread = db.offline_alerts(None, true)?.len();
+                Ok(json!({ "more": false, "alerts": alerts, "unread": unread, "kept": true }))
+            }
+            _ => {
+                let id = text(&params, "id")?;
+                let id = looks_like_vuln_id(&id).unwrap_or(id);
+                match db.offline_vuln(&id)? {
+                    Some((at, vuln)) => Ok(json!({ "vuln": vuln, "seq": 0, "kept_at": at })),
+                    None => Err(e),
+                }
+            }
+        }
+    }
+
+    /// Whether every source of a vulnerability has a fresh answer in the cache.
+    fn all_parts_loaded(&self, id: &str) -> bool {
+        let db = self.db();
+        vuln_parts(id).iter().filter(|p| **p != "kev").all(|p| matches!(db.cache_get(&part_key(id, p), CACHE_SECS), Ok(Some(_))))
     }
 
     /// One page of a target's vulnerability history, newest first.
@@ -920,6 +1013,74 @@ mod tests {
         let status = c.call("status", json!({})).unwrap();
         assert_eq!(status["version"], VERSION);
         assert_eq!(status["unread"], 0);
+    }
+
+    #[test]
+    fn alerted_vulnerabilities_are_kept_for_offline_reading() {
+        use crate::store::{Alert, AlertKind};
+        let c = core();
+        let alert = |id: &str, days_ago: i64| Alert {
+            id: 1,
+            sub_id: 7,
+            sub_name: "polkit".into(),
+            vuln_id: id.into(),
+            kind: AlertKind::New,
+            created_at: Utc::now() - chrono::Duration::days(days_ago),
+            read: false,
+            vuln: json!({ "id": id, "summary": "as alerted" }),
+        };
+        c.db().offline_put(&alert("CVE-2021-4034", 2)).unwrap();
+        c.db().offline_put(&alert("CVE-2020-0001", 10)).unwrap();
+        // Seeing the alert again keeps a newer copy of the vulnerability.
+        c.db().offline_refresh("CVE-2021-4034", &json!({ "id": "CVE-2021-4034", "summary": "newer" })).unwrap();
+        c.db().offline_put(&alert("CVE-2021-4034", 2)).unwrap();
+        assert_eq!(c.db().offline_vuln("CVE-2021-4034").unwrap().unwrap().1["summary"], "newer");
+        let kept = c.db().offline_alerts(Some(7), true).unwrap();
+        assert_eq!(kept.iter().map(|a| a.vuln_id.as_str()).collect::<Vec<_>>(), ["CVE-2021-4034", "CVE-2020-0001"]);
+        assert_eq!(kept[0].vuln["summary"], "newer");
+        assert!(c.db().offline_alerts(Some(8), false).unwrap().is_empty());
+
+        // Saving the settings drops what is older than the chosen time; 0 keeps nothing.
+        let mut s = c.call("settings.get", json!({})).unwrap()["settings"].clone();
+        assert_eq!(s["offline_days"], 7);
+        c.call("settings.set", json!({ "settings": s })).unwrap();
+        assert!(c.db().offline_vuln("CVE-2020-0001").unwrap().is_none());
+        assert!(c.db().offline_vuln("CVE-2021-4034").unwrap().is_some());
+        s["offline_days"] = json!(0);
+        c.call("settings.set", json!({ "settings": s })).unwrap();
+        assert!(c.db().offline_alerts(None, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_paired_app_shows_kept_alerts_when_its_server_is_out_of_reach() {
+        use crate::store::{Alert, AlertKind};
+        let c = Core::with_store(Store::in_memory().unwrap(), true);
+        let mut s = c.call("settings.get", json!({})).unwrap()["settings"].clone();
+        // Nothing listens there.
+        s["remote"] = json!({ "enabled": true, "url": "http://127.0.0.1:9", "token": "t" });
+        c.call("settings.set", json!({ "settings": s })).unwrap();
+        assert!(c.call("alerts.list", json!({})).is_err() || c.call("alerts.list", json!({})).unwrap()["alerts"].as_array().unwrap().is_empty());
+        c.db()
+            .offline_put(&Alert {
+                id: 4,
+                sub_id: 7,
+                sub_name: "polkit".into(),
+                vuln_id: "CVE-2021-4034".into(),
+                kind: AlertKind::New,
+                created_at: Utc::now(),
+                read: false,
+                vuln: json!({ "id": "CVE-2021-4034", "summary": "as alerted" }),
+            })
+            .unwrap();
+        let list = c.call("alerts.list", json!({ "limit": 50 })).unwrap();
+        assert_eq!(list["kept"], true);
+        assert_eq!(list["unread"], 1);
+        assert_eq!(list["alerts"][0]["vuln"]["summary"], "as alerted");
+        let got = c.call("vulns.get", json!({ "id": "cve-2021-4034", "part": "nvd" })).unwrap();
+        assert_eq!(got["vuln"]["summary"], "as alerted");
+        assert!(got["kept_at"].is_i64());
+        // What was never alerted is simply not available.
+        assert!(c.call("vulns.get", json!({ "id": "CVE-2020-0001", "part": "nvd" })).is_err());
     }
 
     #[test]

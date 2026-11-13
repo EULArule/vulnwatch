@@ -150,6 +150,15 @@
       </div>
       {#if app.status?.remote}<span class="hint">How often this phone asks your server. The server has its own interval.</span>{/if}
     </div>
+    <div class="field">
+      Keep alerted vulnerabilities for reading offline
+      <div class="seg">
+        {#each [0, 1, 3, 7, 14, 30, 90] as d}
+          <button class:on={s.offline_days === d} onclick={() => (s!.offline_days = d)}>{d === 0 ? 'Off' : `${d} d`}</button>
+        {/each}
+      </div>
+      <span class="hint">Each alert is saved with its full details for this long, so it still opens when there is no connection.</span>
+    </div>
     <div class="muted small">
       Last check {ago(app.status?.last_check)}
       {#if app.status?.last_errors?.length}

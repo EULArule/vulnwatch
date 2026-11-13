@@ -33,6 +33,16 @@ CREATE TABLE IF NOT EXISTS alerts (
 );
 CREATE INDEX IF NOT EXISTS alerts_created ON alerts (created_at);
 CREATE TABLE IF NOT EXISTS cache (key TEXT PRIMARY KEY, fetched_at INTEGER NOT NULL, body TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS offline (
+    vuln_id TEXT NOT NULL,
+    sub_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    alerted_at INTEGER NOT NULL,
+    alert TEXT NOT NULL,
+    vuln_at INTEGER NOT NULL,
+    vuln TEXT NOT NULL,
+    PRIMARY KEY (vuln_id, sub_id, kind)
+);
 "#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -333,6 +343,70 @@ impl Store {
         )?;
         // Keep the cache small: drop anything older than a week.
         self.conn.execute("DELETE FROM cache WHERE fetched_at < ?1", [now - 7 * 86400])?;
+        Ok(())
+    }
+
+    /// Keep an alert, with the vulnerability as it was then, for when nothing can be reached.
+    /// Saving it again (a paired app sees the same alert in every list) keeps a newer copy of
+    /// the vulnerability if there is one.
+    pub fn offline_put(&self, alert: &Alert) -> Result<()> {
+        let mut bare = alert.clone();
+        bare.vuln = Value::Null;
+        self.conn.execute(
+            "INSERT INTO offline (vuln_id, sub_id, kind, alerted_at, alert, vuln_at, vuln) VALUES (?1, ?2, ?3, ?4, ?5, ?4, ?6)
+             ON CONFLICT(vuln_id, sub_id, kind) DO UPDATE SET alert = excluded.alert, alerted_at = excluded.alerted_at",
+            params![alert.vuln_id, alert.sub_id, alert.kind.as_str(), alert.created_at.timestamp(), serde_json::to_string(&bare)?, alert.vuln.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Several at once, in one transaction.
+    pub fn offline_put_all(&self, alerts: &[Alert]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for a in alerts {
+            self.offline_put(a)?;
+        }
+        Ok(tx.commit()?)
+    }
+
+    /// Replace the kept copy of a vulnerability with what is known now. Does nothing for one that is not kept.
+    pub fn offline_refresh(&self, vuln_id: &str, vuln: &Value) -> Result<()> {
+        self.conn.execute(
+            "UPDATE offline SET vuln = ?2, vuln_at = ?3 WHERE vuln_id = ?1",
+            params![vuln_id, vuln.to_string(), Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// The kept copy of a vulnerability and when it was taken (Unix seconds).
+    pub fn offline_vuln(&self, vuln_id: &str) -> Result<Option<(i64, Value)>> {
+        let row: Option<(i64, String)> = self
+            .conn
+            .query_row("SELECT vuln_at, vuln FROM offline WHERE vuln_id = ?1 ORDER BY vuln_at DESC LIMIT 1", [vuln_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        Ok(row.and_then(|(at, body)| Some((at, serde_json::from_str(&body).ok()?))))
+    }
+
+    /// The kept alerts, newest first.
+    pub fn offline_alerts(&self, sub_id: Option<i64>, unread_only: bool) -> Result<Vec<Alert>> {
+        let mut stmt = self.conn.prepare("SELECT alert, vuln FROM offline ORDER BY alerted_at DESC, rowid DESC")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = vec![];
+        for row in rows {
+            let (alert, vuln) = row?;
+            let Ok(mut alert) = serde_json::from_str::<Alert>(&alert) else { continue };
+            alert.vuln = serde_json::from_str(&vuln).unwrap_or(Value::Null);
+            if sub_id.is_none_or(|s| s == alert.sub_id) && !(unread_only && alert.read) {
+                out.push(alert);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Forget kept alerts older than `days` (all of them for 0).
+    pub fn offline_purge(&self, days: u32) -> Result<()> {
+        let horizon = if days == 0 { i64::MAX } else { Utc::now().timestamp() - days as i64 * 86400 };
+        self.conn.execute("DELETE FROM offline WHERE alerted_at < ?1", [horizon])?;
         Ok(())
     }
 

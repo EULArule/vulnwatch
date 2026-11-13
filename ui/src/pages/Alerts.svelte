@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { Alert } from '../lib/types';
-  import { app, call, refreshStatus, refreshSubs, toast } from '../lib/state.svelte';
+  import { app, call, check, checkNow, refreshSubs, watchCheck } from '../lib/state.svelte';
   import { ago, dayLabel } from '../lib/format';
   import Icon from '../components/Icon.svelte';
   import VulnRow from '../components/VulnRow.svelte';
@@ -10,6 +10,8 @@
   let alerts: Alert[] = $state([]);
   let more = $state(false);
   let loading = $state(true);
+  /** The server could not be reached: the list is what this device kept. */
+  let kept = $state(false);
   const FILTER_KEY = 'vulnwatch.alerts.unreadOnly';
   function stored() {
     try {
@@ -27,12 +29,11 @@
       /* the choice just won't be remembered */
     }
   }
-  let checking = $state(false);
 
   const sub = $derived(subId ? app.subs.find((s) => s.id === subId) : null);
 
-  async function load(append = false) {
-    if (!append) loading = true;
+  async function load(append = false, quiet = false) {
+    if (!append && !quiet) loading = true;
     const r = await call('alerts.list', {
       sub_id: subId,
       unread_only: unreadOnly,
@@ -43,6 +44,7 @@
     if (!r) return;
     alerts = append ? [...alerts, ...r.alerts] : r.alerts;
     more = r.more;
+    if (!append) kept = !!r.kept;
     if (app.status) app.status.unread = r.unread;
   }
 
@@ -56,9 +58,22 @@
   let lastUnread = app.status?.unread ?? 0;
   $effect(() => {
     const n = app.status?.unread ?? 0;
-    if (n > lastUnread) load();
+    if (n > lastUnread) load(false, true);
     lastUnread = n;
   });
+
+  // A check may be running already: one started here before leaving the page, or the timed one.
+  watchCheck();
+  // Show what a check finds as it finds it, not only once every source has answered.
+  let lastChange = check.changes;
+  $effect(() => {
+    if (check.changes !== lastChange) load(false, true);
+    lastChange = check.changes;
+  });
+
+  function secs(ms: number, whole = false) {
+    return whole || ms >= 10_000 ? `${Math.floor(ms / 1000)}s` : `${(ms / 1000).toFixed(1)}s`;
+  }
 
   const groups = $derived.by(() => {
     const out: { day: string; items: Alert[] }[] = [];
@@ -101,16 +116,6 @@
     refreshSubs();
   }
 
-  async function checkNow() {
-    checking = true;
-    const r = await call('poll');
-    checking = false;
-    if (!r) return;
-    if (r.errors.length) toast(r.errors[0], 'error');
-    else toast(r.skipped ? 'A check is already running' : r.new ? `${r.new} new alert${r.new === 1 ? '' : 's'}` : 'Nothing new');
-    await Promise.all([load(), refreshStatus(), refreshSubs()]);
-  }
-
   const hasUnread = $derived(alerts.some((a) => !a.read));
 </script>
 
@@ -126,10 +131,45 @@
       {/if}
     </div>
   </div>
-  <button class="btn sm" onclick={checkNow} disabled={checking}>
-    {#if checking}<span class="spinner"></span>{:else}<Icon name="refresh" size={18} />{/if} Check now
-  </button>
+  {#if check.running}
+    <button class="btn sm" onclick={() => (check.open = !check.open)} aria-expanded={check.open} title="Show what is being checked">
+      <span class="spinner"></span> Checking… {secs(check.ms ?? 0, true)}
+    </button>
+  {:else}
+    <button class="btn sm" onclick={checkNow}><Icon name="refresh" size={18} /> Check now</button>
+  {/if}
 </header>
+
+{#if check.open && (check.running || check.steps.length)}
+  <div class="card steps">
+    <div class="row top">
+      <b class="grow small">
+        {#if check.running}
+          Checking{check.found ? ` · ${check.found} new so far` : ''}
+        {:else}
+          Last check took {secs(check.ms ?? 0)}{check.found ? ` · ${check.found} new` : ''}
+        {/if}
+      </b>
+      <button class="del" onclick={() => (check.open = false)} aria-label="Hide" title="Hide"><Icon name="x" size={16} /></button>
+    </div>
+    {#each check.steps as s, i (i)}
+      <div class="step {s.state}">
+        <span class="mark">
+          {#if s.state === 'running'}<span class="spinner"></span>{:else}<Icon name={s.state === 'done' ? 'check' : 'x'} size={17} />{/if}
+        </span>
+        <span class="grow what">
+          {s.name}
+          {#if s.error}<span class="small why">{s.error}</span>{/if}
+        </span>
+        <span class="took small">{secs(s.ms, s.state === 'running')}</span>
+      </div>
+    {:else}
+      <div class="step muted small">Starting…</div>
+    {/each}
+  </div>
+{:else if !check.running && check.steps.length}
+  <p class="lastrun"><button class="link small" onclick={() => (check.open = true)}>What the last check did</button></p>
+{/if}
 
 <div class="row wrap bar">
   <div class="chips grow">
@@ -141,6 +181,9 @@
   {#if alerts.length}<button class="btn ghost sm" onclick={clearAll} aria-label="Delete all" title="Delete all"><Icon name="trash" size={18} /></button>{/if}
 </div>
 
+{#if kept && !loading}
+  <div class="card pad offline small">No connection to your server. These are the alerts saved on this device.</div>
+{/if}
 {#if loading}
   <div class="loading"><span class="spinner"></span></div>
 {:else if !alerts.length}
@@ -185,6 +228,70 @@
   }
   .err {
     color: var(--danger);
+  }
+  .steps {
+    margin-bottom: 0.8rem;
+    padding: 0.5rem 1rem 0.6rem;
+  }
+  .steps .top {
+    min-height: 2rem;
+  }
+  .step {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.6rem;
+    padding: 0.3rem 0;
+  }
+  .mark {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 1.2rem;
+    height: 1.3rem;
+  }
+  .mark .spinner {
+    width: 15px;
+    height: 15px;
+    border-width: 2px;
+  }
+  .step.done .mark {
+    color: var(--ok);
+  }
+  .step.failed .mark,
+  .why {
+    color: var(--danger);
+  }
+  .what {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+  .why {
+    display: block;
+  }
+  .took {
+    flex: none;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .step.running .took {
+    color: var(--text);
+    font-weight: 600;
+  }
+  .lastrun {
+    margin: -0.5rem 0 0.5rem;
+    text-align: right;
+  }
+  .link {
+    border: 0;
+    padding: 0.2rem 0;
+    background: none;
+    color: var(--muted);
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .offline {
+    margin: 0.6rem 0;
+    color: var(--muted);
   }
   .day {
     margin: 1.1rem 0 0.5rem;

@@ -1,6 +1,6 @@
 // App-wide reactive state: route, session, status, toasts.
 import { AuthError, getToken, health, isApp, rpc, setToken } from './api';
-import type { Settings, Status, Subscription } from './types';
+import type { CheckStep, Settings, Status, Subscription } from './types';
 
 function parseRoute(): string[] {
   const h = location.hash.replace(/^#\/?/, '');
@@ -54,6 +54,7 @@ export async function refreshStatus() {
     const before = app.status?.unread ?? null;
     app.status = await rpc<Status>('status');
     if (before !== null && app.status.unread > before) browserNotify(app.status.unread - before);
+    if (app.status.checking) watchCheck();
   } catch (e) {
     if (e instanceof AuthError) app.session = 'login';
   }
@@ -62,6 +63,86 @@ export async function refreshStatus() {
 export async function refreshSubs() {
   const r = await call<{ subscriptions: Subscription[] }>('subs.list');
   if (r) app.subs = r.subscriptions;
+}
+
+/** The check that is running, or the last one. Lives here so it survives moving between pages. */
+export const check = $state({
+  running: false,
+  steps: [] as CheckStep[],
+  /** How long the check has been going, or took. */
+  ms: null as number | null,
+  /** Alerts it has raised so far. */
+  found: 0,
+  /** Goes up whenever the alert list is worth reloading. */
+  changes: 0,
+  /** Whether the list of steps is shown. */
+  open: false,
+});
+
+interface CheckProgress {
+  running: boolean;
+  ms: number | null;
+  new: number;
+  steps: CheckStep[];
+}
+
+let asking = false;
+let watching = false;
+
+/** Follow a check until it ends: its steps, and alerts as they are raised. Safe to call any time. */
+export async function watchCheck() {
+  if (watching) return;
+  watching = true;
+  try {
+    for (;;) {
+      let p: CheckProgress;
+      try {
+        p = await rpc<CheckProgress>('poll.progress');
+      } catch {
+        break;
+      }
+      // Just after asking for a check the answer may still describe the one before it.
+      if (p.running || !asking) {
+        const more = p.new > check.found;
+        const ended = check.running && !p.running;
+        check.steps = p.steps;
+        check.ms = p.ms;
+        check.found = p.new;
+        if (more || ended) {
+          check.changes++;
+          refreshStatus();
+          refreshSubs();
+        }
+      }
+      check.running = p.running || asking;
+      if (!check.running) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  } finally {
+    watching = false;
+    check.running = asking;
+  }
+}
+
+export async function checkNow() {
+  if (check.running) return;
+  asking = true;
+  check.running = true;
+  check.steps = [];
+  check.ms = 0;
+  check.found = 0;
+  watchCheck();
+  const r = await call('poll');
+  asking = false;
+  watchCheck();
+  if (!r) {
+    check.running = watching;
+    return;
+  }
+  if (r.errors.length) toast(r.errors[0], 'error');
+  else toast(r.skipped ? 'A check is already running' : r.new ? `${r.new} new alert${r.new === 1 ? '' : 's'}` : 'Nothing new');
+  check.changes++;
+  await Promise.all([refreshStatus(), refreshSubs()]);
 }
 
 export async function loadSettings() {

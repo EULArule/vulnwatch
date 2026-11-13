@@ -37,6 +37,7 @@ pub struct Core {
     kev: Mutex<Option<Arc<BTreeMap<String, String>>>>,
     /// Counts `assemble` calls (and keeps them one at a time); see there.
     assembled: Mutex<u64>,
+    progress: Mutex<engine::Progress>,
 }
 
 impl Core {
@@ -46,7 +47,7 @@ impl Core {
     }
 
     pub fn with_store(store: Store, mobile: bool) -> Self {
-        Self { store: Mutex::new(store), net: Net::new(), poll_lock: Mutex::new(()), mobile, kev: Mutex::new(None), assembled: Mutex::new(0) }
+        Self { store: Mutex::new(store), net: Net::new(), poll_lock: Mutex::new(()), mobile, kev: Mutex::new(None), assembled: Mutex::new(0), progress: Default::default() }
     }
 
     pub(crate) fn db(&self) -> MutexGuard<'_, Store> {

@@ -35,7 +35,7 @@ fn request(net: &Net, key: Option<&str>, url: &str, query: &[(&str, &str)]) -> R
         match net.get_json(url, query, &headers) {
             Ok(v) => return Ok(v),
             Err(e) => {
-                let retryable = matches!(status_of(&e), Some(403 | 429 | 500..=599) | None);
+                let retryable = matches!(status_of(&e), Some(403 | 429 | 500..=599) | None) && !crate::net::no_connection(&e);
                 if attempt == 3 || !retryable {
                     return Err(e).context("NVD request failed");
                 }
