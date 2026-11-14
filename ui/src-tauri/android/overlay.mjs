@@ -47,6 +47,15 @@ if (!manifest.includes(MARK)) {
     .replace(/^(\s*)<\/application>/m, (m) => components + m);
   writeFileSync(manifestPath, manifest);
 }
+// Added later than the block above, so it has its own check (the project may already be marked).
+// Lets the "battery friendly" alarm fire on time once the user allows "Alarms & reminders".
+if (!manifest.includes('SCHEDULE_EXACT_ALARM')) {
+  manifest = manifest.replace(
+    /^(\s*)<application/m,
+    (m) => `    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />\n` + m,
+  );
+  writeFileSync(manifestPath, manifest);
+}
 
 const gradlePath = join(app, 'build.gradle.kts');
 let gradle = readFileSync(gradlePath, 'utf8');

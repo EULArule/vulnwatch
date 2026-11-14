@@ -61,6 +61,7 @@ object Native {
                 "state" -> state(ctx)
                 "request_notifications" -> { requestNotifications(ctx); "true" }
                 "request_battery" -> { requestBattery(ctx); "true" }
+                "request_alarms" -> { requestAlarms(ctx); "true" }
                 "reschedule" -> { Scheduler.apply(ctx); "true" }
                 "notify" -> { Notifier.show(ctx, JSONArray(arg)); "true" }
                 "take_route" -> {
@@ -83,6 +84,7 @@ object Native {
         return JSONObject()
             .put("notifications", notificationsAllowed(ctx))
             .put("battery_exempt", power.isIgnoringBatteryOptimizations(ctx.packageName))
+            .put("exact_alarms", Scheduler.exact(ctx))
             .toString()
     }
 
@@ -106,6 +108,13 @@ object Native {
     private fun requestBattery(ctx: Context) {
         val direct = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:${ctx.packageName}"))
         if (!open(ctx, direct)) open(ctx, Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+    }
+
+    /** The "Alarms & reminders" switch for this app; without it Android moves the check alarm around. */
+    private fun requestAlarms(ctx: Context) {
+        val app = Uri.parse("package:${ctx.packageName}")
+        if (Build.VERSION.SDK_INT >= 31 && open(ctx, Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, app))) return
+        open(ctx, Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, app))
     }
 
     private fun open(ctx: Context, intent: Intent): Boolean = try {

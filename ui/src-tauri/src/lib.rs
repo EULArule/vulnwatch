@@ -75,7 +75,7 @@ mod host {
 
     pub fn call(what: &str, _arg: &str) -> Result<Value, String> {
         Ok(match what {
-            "state" => json!({ "notifications": true, "battery_exempt": true }),
+            "state" => json!({ "notifications": true, "battery_exempt": true, "exact_alarms": true }),
             _ => Value::Null,
         })
     }
@@ -197,7 +197,7 @@ mod host {
         to_java(&mut env, &out.to_string())
     }
 
-    /// `Native.config()`: what the scheduler needs to know, `{background, interval_minutes}`.
+    /// `Native.config()`: what the scheduler needs to know, `{background, interval_minutes, since_last}`.
     #[no_mangle]
     pub extern "system" fn Java_app_vulnwatch_Native_config<'l>(mut env: JNIEnv<'l>, _class: JClass<'l>) -> jstring {
         let out = catch_unwind(|| match core() {
@@ -205,7 +205,7 @@ mod host {
                 let s = core.settings();
                 // Checking turned off altogether is, to the scheduler, background mode "off".
                 let background = if s.interval_minutes == 0 { "off" } else { s.background.as_str() };
-                json!({ "background": background, "interval_minutes": s.interval_minutes })
+                json!({ "background": background, "interval_minutes": s.interval_minutes, "since_last": core.since_last_check() })
             }
             Err(_) => json!({ "background": "periodic", "interval_minutes": 15 }),
         })

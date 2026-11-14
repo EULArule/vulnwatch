@@ -8,7 +8,7 @@
 
   let s = $state<Settings | null>(null);
   let saved = '';
-  let android: { notifications: boolean; battery_exempt: boolean } | null = $state(null);
+  let android: { notifications: boolean; battery_exempt: boolean; exact_alarms: boolean } | null = $state(null);
   let testing = $state(false);
   let pairing = $state(false);
   let browserPerm = $state('Notification' in window ? Notification.permission : 'unsupported');
@@ -45,6 +45,21 @@
     if (s && s.interval_minutes > 0 && s.interval_minutes < shortest) s.interval_minutes = shortest;
   });
   const every = (m: number) => (m === 0 ? 'Off' : m < 60 ? `${m} m` : `${m / 60} h`);
+
+  // What this device itself checked and when: the way to see whether background checks run.
+  type Past = { at: string; by: string; ms?: number; new?: number; errors?: string[]; unfinished?: boolean };
+  let history = $state<Past[] | null>(null);
+  async function toggleHistory() {
+    if (history) return (history = null);
+    history = (await call<{ checks: Past[] }>('poll.history'))?.checks ?? [];
+  }
+  const when = (iso: string) => new Date(iso).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+  function outcome(c: Past) {
+    if (c.unfinished) return 'started but never finished';
+    const took = `${((c.ms ?? 0) / 1000).toFixed(1)} s`;
+    if (c.errors?.length) return `${took}, ${c.errors.length === 1 ? 'a problem' : `${c.errors.length} problems`}: ${c.errors[0]}`;
+    return `${took}, ${c.new ? `${c.new} new` : 'nothing new'}`;
+  }
 
   async function test() {
     testing = true;
@@ -83,7 +98,7 @@
     }, 900);
   }
 
-  async function androidAsk(what: 'notifications' | 'battery') {
+  async function androidAsk(what: 'notifications' | 'battery' | 'alarms') {
     await call('android.request_' + what);
     // The system dialog is asynchronous; re-read once the user is back.
     setTimeout(async () => (android = (await call('android.state')) ?? android), 1500);
@@ -108,7 +123,7 @@
       <div class="options">
         <label class="opt" class:on={s.background === 'periodic'}>
           <input type="radio" bind:group={s.background} value="periodic" />
-          <span><b>Battery friendly</b><small>Checks on a schedule, even when the app is closed. Android may delay a check while the phone is idle.</small></span>
+          <span><b>Battery friendly</b><small>Wakes up for each check, even when the app is closed, and sleeps in between.</small></span>
         </label>
         <label class="opt" class:on={s.background === 'realtime'}>
           <input type="radio" bind:group={s.background} value="realtime" />
@@ -133,6 +148,15 @@
           <button class="btn sm" onclick={() => androidAsk('battery')}>Exempt</button>
         </div>
       {/if}
+      {#if android?.exact_alarms && s.background === 'periodic' && s.interval_minutes > 0}
+        <p class="hint">Android lets vulnwatch start each check on time (exact alarms are allowed).</p>
+      {/if}
+      {#if android && android.exact_alarms === false && s.background === 'periodic' && s.interval_minutes > 0}
+        <div class="warn row">
+          <span class="grow"><b>Checks may run late</b><br /><span class="small">Android delays background checks, sometimes by hours, unless vulnwatch may set alarms. Allowing it only lets the checks start on time; nothing rings or shows.</span></span>
+          <button class="btn sm primary" onclick={() => androidAsk('alarms')}>Allow</button>
+        </div>
+      {/if}
     </section>
   {/if}
 
@@ -151,9 +175,23 @@
       <span class="hint">Each alert is saved with its full details for this long, so it still opens when there is no connection.</span>
     </div>
     <div class="muted small">
-      Last check {ago(app.status?.last_check)}
+      Last check {ago(app.status?.last_check)} ·
+      <button class="linkbtn" onclick={toggleHistory}>{history ? 'Hide recent checks' : 'Recent checks'}</button>
       {#if app.status?.last_errors?.length}
         <div class="err">{#each app.status.last_errors as e}<div>{e}</div>{/each}</div>
+      {/if}
+      {#if history}
+        <ul class="past">
+          {#each history as c}
+            <li class:bad={c.unfinished || c.errors?.length}>
+              <span class="at">{when(c.at)}</span>
+              <span>{c.by === 'manual' ? 'by hand' : 'automatic'} · {outcome(c)}</span>
+            </li>
+          {:else}
+            <li>None recorded yet. Checks are listed from this version on.</li>
+          {/each}
+        </ul>
+        {#if app.status?.remote}<div>These are this phone's own checks against your server; “Last check” above is the server's.</div>{/if}
       {/if}
     </div>
   </section>
@@ -278,6 +316,27 @@
   section {
     margin-bottom: 0.9rem;
     gap: 0.9rem;
+  }
+  .past {
+    list-style: none;
+    margin: 0.5rem 0 0;
+    padding: 0;
+    max-height: 18rem;
+    overflow-y: auto;
+  }
+  .past li {
+    display: flex;
+    gap: 0.7rem;
+    padding: 0.25rem 0;
+    border-top: 1px solid var(--border);
+  }
+  .past .at {
+    flex: none;
+    width: 6.2rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .past .bad {
+    color: var(--danger);
   }
   .field {
     display: flex;

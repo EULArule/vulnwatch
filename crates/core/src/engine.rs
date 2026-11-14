@@ -63,6 +63,9 @@ impl Drop for Running<'_> {
     }
 }
 
+/// How many past checks `check_history` remembers.
+const HISTORY: usize = 60;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct KevState {
     etag: Option<String>,
@@ -73,18 +76,96 @@ struct KevState {
 impl Core {
     /// Run one check. Never fails: problems are reported in `errors` and retried next time.
     pub fn poll(&self) -> PollReport {
-        let Ok(_guard) = self.poll_lock.try_lock() else {
-            return PollReport { skipped: true, ..Default::default() };
+        self.poll_by("schedule")
+    }
+
+    /// A check, noting who asked for it ("schedule" or "manual") in the history.
+    pub fn poll_by(&self, by: &str) -> PollReport {
+        let _guard = match self.poll_lock.try_lock() {
+            Ok(guard) => guard,
+            // An earlier check crashed while holding the lock. That must not stop every later one.
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            // Another check is running (two triggers at once, say). Its result covers this one.
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return PollReport { skipped: true, ..Default::default() };
+            }
         };
-        *self.progress() = Progress { running: true, started: Some(Instant::now()), ..Default::default() };
+        let started = Instant::now();
+        // A check that never gets to its end (the system killed the app, say) leaves this behind.
+        let lost: Option<Value> = self.db().get("check_started").ok().flatten();
+        if let Some(mut lost) = lost {
+            lost["unfinished"] = json!(true);
+            self.remember(lost);
+        }
+        self.db().set("check_started", &json!({ "at": Utc::now(), "by": by })).ok();
+        *self.progress() = Progress { running: true, started: Some(started), ..Default::default() };
         let _running = Running(self);
+        // A crash in one check is reported like any other error, and the next check runs as usual.
+        let mut report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.poll_once())).unwrap_or_else(|p| {
+            let why = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default();
+            PollReport { errors: vec![format!("the check crashed: {why}")], ..Default::default() }
+        });
+        report.errors.dedup();
+        let now = Utc::now();
+        let db = self.db();
+        let mut status: Value = db.get("status").ok().flatten().unwrap_or_else(|| json!({}));
+        status["last_check"] = json!(now);
+        status["last_errors"] = json!(report.errors);
+        status["last_checked"] = json!(report.checked);
+        status["last_new"] = json!(report.alerts.len());
+        if report.errors.is_empty() {
+            status["last_ok"] = json!(now);
+        }
+        db.set("status", &status).ok();
+        db.delete("check_started").ok();
+        drop(db);
+        self.remember(json!({ "at": now, "by": by, "ms": started.elapsed().as_millis() as u64, "new": report.alerts.len(), "errors": report.errors }));
+        report
+    }
+
+    /// Add to what this device itself did and when, so that a gap in background checks can be
+    /// told apart: not started by the system, failed, or never finished.
+    fn remember(&self, entry: Value) {
+        let db = self.db();
+        let mut history: Vec<Value> = db.get("history").ok().flatten().unwrap_or_default();
+        history.insert(0, entry);
+        history.truncate(HISTORY);
+        db.set("history", &history).ok();
+    }
+
+    /// Seconds since this device last finished a check of its own, or -1 if it has not yet.
+    pub fn since_last_check(&self) -> i64 {
+        let history: Vec<Value> = self.db().get("history").ok().flatten().unwrap_or_default();
+        history
+            .iter()
+            .filter(|c| c["ms"].is_u64())
+            .find_map(|c| serde_json::from_value::<DateTime<Utc>>(c["at"].clone()).ok())
+            .map_or(-1, |at| (Utc::now() - at).num_seconds().max(0))
+    }
+
+    /// The last checks this device ran, newest first.
+    pub fn check_history(&self) -> Value {
+        let db = self.db();
+        let mut history: Vec<Value> = db.get("history").ok().flatten().unwrap_or_default();
+        drop(db);
+        history.retain(|c| c["skipped"] != json!(true));
+        if !self.checking() {
+            if let Some(mut lost) = self.db().get::<Value>("check_started").ok().flatten() {
+                lost["unfinished"] = json!(true);
+                history.insert(0, lost);
+            }
+        }
+        json!({ "checks": history })
+    }
+
+    fn poll_once(&self) -> PollReport {
         let settings = self.settings();
         self.db().offline_purge(settings.offline_days).ok();
         // Alerts from before copies were kept (an update, or the setting was off).
         if self.db().get::<bool>("offline_filled").ok().flatten().is_none() {
             self.keep_recent_alerts(settings.offline_days).ok();
         }
-        let mut report = if settings.remote.enabled {
+        let report = if settings.remote.enabled {
             let report = self
                 .step("vulnwatch server", || self.poll_remote(&settings))
                 .unwrap_or_else(|e| PollReport { errors: vec![format!("server: {e:#}")], ..Default::default() });
@@ -99,18 +180,6 @@ impl Core {
             self.announce(&settings, &mut r);
             r
         };
-        report.errors.dedup();
-        let now = Utc::now();
-        let db = self.db();
-        let mut status: Value = db.get("status").ok().flatten().unwrap_or_else(|| json!({}));
-        status["last_check"] = json!(now);
-        status["last_errors"] = json!(report.errors);
-        status["last_checked"] = json!(report.checked);
-        status["last_new"] = json!(report.alerts.len());
-        if report.errors.is_empty() {
-            status["last_ok"] = json!(now);
-        }
-        db.set("status", &status).ok();
         report
     }
 
@@ -647,6 +716,41 @@ mod tests {
         assert_eq!(p["new"], 1);
         assert_eq!(p["steps"][2]["state"], "done");
         assert!(p["ms"].is_u64());
+    }
+
+    #[test]
+    fn a_crashed_check_does_not_stop_later_ones() {
+        let (core, _) = setup(Filter::default());
+        assert_eq!(core.since_last_check(), -1);
+        // What a check that panicked leaves behind: its lock, poisoned.
+        std::thread::scope(|s| {
+            let _ = s
+                .spawn(|| {
+                    let _held = core.poll_lock.lock().unwrap();
+                    panic!("boom");
+                })
+                .join();
+        });
+        assert!(core.poll_lock.is_poisoned());
+        let mut s = core.settings();
+        s.remote = crate::settings::Remote { enabled: true, url: "http://127.0.0.1:9".into(), ..Default::default() };
+        core.db().set("settings", &s).unwrap();
+        let report = core.poll_by("manual");
+        assert!(!report.skipped);
+        let history = core.check_history();
+        assert_eq!(history["checks"].as_array().unwrap().len(), 1);
+        assert_eq!(history["checks"][0]["by"], "manual");
+        assert!((0..5).contains(&core.since_last_check()));
+        assert!(history["checks"][0]["errors"][0].as_str().unwrap().starts_with("server:"));
+
+        // A check cut short (the app was killed) shows up, and is kept once the next one runs.
+        core.db().set("check_started", &json!({ "at": Utc::now(), "by": "schedule" })).unwrap();
+        assert_eq!(core.check_history()["checks"][0]["unfinished"], true);
+        core.poll();
+        let history = core.check_history();
+        assert_eq!(history["checks"][0]["by"], "schedule");
+        assert_eq!(history["checks"][1]["unfinished"], true);
+        assert_eq!(history["checks"].as_array().unwrap().len(), 3);
     }
 
     fn polkit() -> Advisory {

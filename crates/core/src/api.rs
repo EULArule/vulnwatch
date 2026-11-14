@@ -90,7 +90,7 @@ impl Core {
         if settings.remote.enabled && self.mobile {
             match method {
                 // Device-local state.
-                "settings.get" | "settings.set" | "poll" | "poll.progress" | "remote.test" | "search" => {}
+                "settings.get" | "settings.set" | "poll" | "poll.progress" | "poll.history" | "remote.test" | "search" => {}
                 "status" => {
                     let mut local = self.status(&settings);
                     match self.remote_call(&settings, "status", json!({})) {
@@ -331,7 +331,7 @@ impl Core {
             }
             "status" => Ok(self.status(&settings)),
             "poll" => {
-                let report = self.poll();
+                let report = self.poll_by("manual");
                 Ok(json!({
                     "new": report.alerts.len(),
                     "checked": report.checked,
@@ -341,6 +341,7 @@ impl Core {
                 }))
             }
             "poll.progress" => Ok(self.check_progress()),
+            "poll.history" => Ok(self.check_history()),
             "notify.test" => {
                 let n = Notification {
                     id: 0,

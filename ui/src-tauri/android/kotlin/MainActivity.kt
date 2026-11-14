@@ -16,6 +16,11 @@ class MainActivity : TauriActivity() {
         takeRoute(intent)
         super.onCreate(savedInstanceState)
         fitSystemBars()
+    }
+
+    /** Back from a system settings page, perhaps with exact alarms just allowed: plan again. */
+    override fun onResume() {
+        super.onResume()
         try {
             Scheduler.apply(this)
         } catch (e: Exception) {
