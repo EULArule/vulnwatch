@@ -25,6 +25,11 @@ import java.util.concurrent.TimeUnit
  *              app is next opened, so the job alone is not enough. The alarm is exact when the
  *              user allows "Alarms & reminders"; otherwise Android may still move it by several
  *              minutes. The job only checks when the alarm's check is overdue.
+ *              A second alarm is always set a few minutes behind the first: Android hands an
+ *              alarm over once, and the app can die in that moment (an old process with the
+ *              page still loaded is ended by the WebView as soon as it wakes, if its renderer
+ *              was taken away meanwhile), which would otherwise be the last alarm ever. For
+ *              the same reason the job sets the alarm again when it finds none waiting.
  *  - realtime: a foreground service checking every N minutes, plus a 30-minute job as a watchdog
  *              that brings the service back if the system killed it.
  *  - off:      nothing; the app checks only while it is open.
@@ -44,33 +49,67 @@ object Scheduler {
         return Config(c.optString("background", "periodic"), c.optLong("interval_minutes", 15).coerceAtLeast(1), c.optLong("since_last", -1))
     }
 
-    private fun alarm(ctx: Context): PendingIntent =
+    /** The alarm for the check, and the one behind it in case the first comes to nothing. */
+    private const val FIRST = 1
+    private const val SECOND = 2
+    /** How far behind, in seconds. */
+    private const val BEHIND = 180L
+
+    private fun alarm(ctx: Context, which: Int, flags: Int = PendingIntent.FLAG_UPDATE_CURRENT): PendingIntent? =
         PendingIntent.getBroadcast(
-            ctx, 1, Intent(ctx, BootReceiver::class.java).setAction(TICK),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            ctx, which, Intent(ctx, BootReceiver::class.java).setAction(TICK),
+            flags or PendingIntent.FLAG_IMMUTABLE,
         )
 
     /** Whether Android lets this app set alarms for an exact time ("Alarms & reminders"). */
     fun exact(ctx: Context): Boolean =
         Build.VERSION.SDK_INT < 31 || (ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager).canScheduleExactAlarms()
 
-    /** Set the alarm for [seconds] from now. Both kinds may fire while the phone is idle. */
+    /**
+     * Set the alarm for [seconds] from now, and the second one behind it. Setting them again
+     * moves both, so the second only ever goes off when the first did not get this far.
+     */
     private fun arm(ctx: Context, seconds: Long) {
+        set(ctx, FIRST, seconds)
+        set(ctx, SECOND, seconds + BEHIND)
+    }
+
+    /** Both kinds of alarm may fire while the phone is idle. */
+    private fun set(ctx: Context, which: Int, seconds: Long) {
         val alarms = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
         val at = SystemClock.elapsedRealtime() + seconds * 1000
+        val intent = alarm(ctx, which) ?: return
         try {
             if (exact(ctx)) {
-                alarms.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, at, alarm(ctx))
+                alarms.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, at, intent)
                 return
             }
         } catch (e: SecurityException) {
             // The permission was taken away between the question and the call.
         }
-        alarms.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, at, alarm(ctx))
+        alarms.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, at, intent)
     }
 
     private fun disarm(ctx: Context) {
-        (ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager).cancel(alarm(ctx))
+        val alarms = ctx.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        for (which in intArrayOf(FIRST, SECOND)) alarm(ctx, which)?.let { alarms.cancel(it) }
+    }
+
+    /** When the next check is due, in seconds: counted from the last one, not from now. */
+    private fun due(cfg: Config): Long {
+        val every = cfg.minutes.coerceAtLeast(15) * 60
+        return if (cfg.sinceLast < 0) every else (every - cfg.sinceLast).coerceIn(60, every)
+    }
+
+    /**
+     * Called by the periodic job: set the alarm again if none is waiting. An alarm is lost
+     * when the app dies while taking it, and nothing else would notice before the app is opened.
+     */
+    fun rearm(context: Context, cfg: Config) {
+        val ctx = context.applicationContext
+        if (cfg.mode != "periodic") return
+        if (alarm(ctx, FIRST, PendingIntent.FLAG_NO_CREATE) != null || alarm(ctx, SECOND, PendingIntent.FLAG_NO_CREATE) != null) return
+        arm(ctx, due(cfg))
     }
 
     /** The alarm went off: set the next one, and have a check run now. */
@@ -108,8 +147,7 @@ object Scheduler {
             WatchService.start(ctx)
         } else {
             // Counted from the last check, so that opening the app does not push the next one back.
-            val due = if (cfg.sinceLast < 0) every * 60 else (every * 60 - cfg.sinceLast).coerceIn(60, every * 60)
-            arm(ctx, due)
+            arm(ctx, due(cfg))
             WatchService.stop(ctx)
         }
     }

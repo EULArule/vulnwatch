@@ -12,6 +12,7 @@ class PollWorker(context: Context, params: WorkerParameters) : Worker(context, p
         if (!Native.ensure(ctx)) return Result.retry()
         val cfg = Scheduler.config()
         if (cfg.mode == "off") return Result.success()
+        Scheduler.rearm(ctx, cfg)
         if (cfg.mode == "realtime") {
             if (WatchService.running) return Result.success()
             // The service was killed. Bring it back; if Android refuses (background start
