@@ -5,6 +5,7 @@
   import { ago } from '../lib/format';
   import Icon from '../components/Icon.svelte';
   import Choice from '../components/Choice.svelte';
+  import Transfer from '../components/Transfer.svelte';
 
   let s = $state<Settings | null>(null);
   let saved = '';
@@ -16,14 +17,17 @@
   async function load() {
     const r = await call<{ settings: Settings }>('settings.get');
     if (!r) return;
+    clearTimeout(timer);
     saved = JSON.stringify(r.settings);
     s = r.settings;
+    // Also called after an import, which may have changed any of them.
+    app.settings = r.settings;
+    applyTheme(r.settings.theme);
     if (isApp) android = (await call('android.state')) ?? null;
   }
-  load();
-
   // Every change saves itself shortly after; there is no Save button to forget.
   let timer: ReturnType<typeof setTimeout>;
+  load();
   $effect(() => {
     if (!s) return;
     const now = JSON.stringify(s);
@@ -293,6 +297,8 @@
       </div>
     </section>
   {/if}
+
+  <Transfer onimported={load} />
 
   <section class="card pad stack">
     <h2>Appearance</h2>

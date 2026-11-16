@@ -91,6 +91,8 @@ impl Core {
             match method {
                 // Device-local state.
                 "settings.get" | "settings.set" | "poll" | "poll.progress" | "poll.history" | "remote.test" | "search" => {}
+                // Settings are this device's, the rest is the server's: both sides take part.
+                "data.export" | "data.import" => {}
                 "status" => {
                     let mut local = self.status(&settings);
                     match self.remote_call(&settings, "status", json!({})) {
@@ -221,14 +223,7 @@ impl Core {
             }
             "subs.save" => {
                 let mut sub: Subscription = arg(&params, "subscription")?;
-                sub.name = sub.name.trim().to_string();
-                if sub.name.is_empty() {
-                    sub.name = default_name(&sub.target);
-                }
-                clean_target(&mut sub.target)?;
-                clean_filter(&mut sub.filter);
-                // Compiling validates the keyword phrases.
-                Compiled::new(sub.clone())?;
+                clean_subscription(&mut sub)?;
                 let db = self.db();
                 if sub.id == 0 {
                     let same = db.subscriptions()?.into_iter().find(|s| s.target == sub.target && s.filter == sub.filter);
@@ -300,26 +295,10 @@ impl Core {
             "settings.get" => Ok(json!({ "settings": settings })),
             "settings.set" => {
                 let new: Settings = arg(&params, "settings")?;
-                let new = new.sanitize();
-                let db = self.db();
-                if new.remote != settings.remote {
-                    db.delete("remote_last_alert")?;
-                }
-                if new.nvd_api_key != settings.nvd_api_key
-                    || new.use_circl != settings.use_circl
-                    || new.use_euvd != settings.use_euvd
-                    || new.cvedetails_token != settings.cvedetails_token
-                {
-                    db.cache_clear()?;
-                }
-                db.offline_purge(new.offline_days)?;
-                db.set("settings", &new)?;
-                drop(db);
-                if new.offline_days > settings.offline_days {
-                    self.keep_recent_alerts(new.offline_days)?;
-                }
-                Ok(json!({ "settings": new }))
+                Ok(json!({ "settings": self.apply_settings(&settings, new)? }))
             }
+            "data.export" => self.export_data(&settings, &params),
+            "data.import" => self.import_data(&settings, &params),
             "remote.test" => {
                 let probe = Settings {
                     remote: crate::settings::Remote { enabled: true, url: text(&params, "url")?, token: params["token"].as_str().unwrap_or_default().into() },
@@ -360,6 +339,29 @@ impl Core {
             }
             _ => bail!("unknown method `{method}`"),
         }
+    }
+
+    /// Store new settings and do what the change calls for. Returns them as stored.
+    pub(crate) fn apply_settings(&self, old: &Settings, new: Settings) -> Result<Settings> {
+        let new = new.sanitize();
+        let db = self.db();
+        if new.remote != old.remote {
+            db.delete("remote_last_alert")?;
+        }
+        if new.nvd_api_key != old.nvd_api_key
+            || new.use_circl != old.use_circl
+            || new.use_euvd != old.use_euvd
+            || new.cvedetails_token != old.cvedetails_token
+        {
+            db.cache_clear()?;
+        }
+        db.offline_purge(new.offline_days)?;
+        db.set("settings", &new)?;
+        drop(db);
+        if new.offline_days > old.offline_days {
+            self.keep_recent_alerts(new.offline_days)?;
+        }
+        Ok(new)
     }
 
     fn status(&self, settings: &Settings) -> Value {
@@ -866,6 +868,19 @@ fn default_name(target: &Target) -> String {
 fn clean_list(list: &mut Vec<String>) {
     *list = list.iter().map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect();
     list.dedup();
+}
+
+/// Tidy a subscription that came from outside and refuse one that cannot work.
+pub(crate) fn clean_subscription(sub: &mut Subscription) -> Result<()> {
+    sub.name = sub.name.trim().to_string();
+    if sub.name.is_empty() {
+        sub.name = default_name(&sub.target);
+    }
+    clean_target(&mut sub.target)?;
+    clean_filter(&mut sub.filter);
+    // Compiling validates the keyword phrases.
+    Compiled::new(sub.clone())?;
+    Ok(())
 }
 
 fn clean_target(target: &mut Target) -> Result<()> {

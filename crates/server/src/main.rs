@@ -14,6 +14,9 @@ use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use vulnwatch_core::{Core, VERSION};
 
+/// The largest request taken. Nearly all are tiny; an import with years of alerts is not.
+const MAX_BODY: u64 = 64 << 20;
+
 static UI: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../ui/dist");
 
 const HELP: &str = "\
@@ -223,7 +226,7 @@ fn handle(mut req: Request, core: &Core, token: Option<&str>) {
                 json_response(401, &json!({ "error": "unauthorized" }))
             } else {
                 let mut body = String::new();
-                match req.as_reader().take(1 << 20).read_to_string(&mut body).ok().and_then(|_| serde_json::from_str::<Value>(&body).ok()) {
+                match req.as_reader().take(MAX_BODY).read_to_string(&mut body).ok().and_then(|_| serde_json::from_str::<Value>(&body).ok()) {
                     None => json_response(400, &json!({ "error": "invalid request" })),
                     Some(call) => {
                         let method = call["method"].as_str().unwrap_or_default();

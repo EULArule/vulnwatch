@@ -62,6 +62,20 @@ optimisation; the settings page offers both when needed.
 **Pairing with a server** (Settings → Use my vulnwatch server): the app becomes a client of your
 server, sharing its subscriptions and alerts, and only asks it "anything new?" in the background.
 
+## Export and import
+
+**Settings → Export and import** puts your setup in one JSON file and reads such a file back, in
+the app and in the web UI alike. You choose what goes in: the settings, what you watch (with the
+alerts received so far, if you like), or both. API keys, the ntfy and webhook channels and the
+server connection are only included when you ask for them, so a file without them can be handed
+to someone else. On Android the file is saved through the system's file picker or sent through
+the share sheet.
+
+Importing adds to what is there. Subscriptions you already have (same target, same filter) are
+left alone, alerts are never listed twice and raise no notifications, and settings the file does
+not carry keep their value. You can also take only part of a file. A paired app exports and
+imports its own settings, and its server's subscriptions and alerts.
+
 ## Where the data comes from
 
 | Source | Used for |

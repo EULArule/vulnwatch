@@ -13,6 +13,7 @@ pub mod notify;
 pub mod settings;
 pub mod sources;
 pub mod store;
+mod transfer;
 
 use std::{
     collections::BTreeMap,

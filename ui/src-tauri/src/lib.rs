@@ -28,14 +28,16 @@ fn core() -> Result<Arc<Core>, String> {
 
 fn handle(method: &str, params: Value) -> Result<Value, String> {
     if let Some(what) = method.strip_prefix("android.") {
-        return host::call(what, "");
+        // The few that take something (a file to save or share) get it as JSON.
+        let arg = if params.is_null() { String::new() } else { params.to_string() };
+        return host::call(what, &arg);
     }
     let result = core()?.call(method, params).map_err(|e| format!("{e:#}"))?;
     // Things only the host can do: show notifications on this device, and re-plan background work.
     match method {
         "poll" => host::notify(&result["notifications"]),
         "notify.test" => host::notify(&json!([result["notification"]])),
-        "settings.set" => {
+        "settings.set" | "data.import" => {
             let _ = host::call("reschedule", "");
         }
         _ => {}

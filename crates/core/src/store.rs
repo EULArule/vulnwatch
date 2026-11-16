@@ -124,6 +124,14 @@ impl Store {
         Ok(())
     }
 
+    /// Do several writes as one: all of them happen, or (on an error) none.
+    pub fn all_or_nothing<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        let tx = self.conn.unchecked_transaction()?;
+        let out = work()?;
+        tx.commit()?;
+        Ok(out)
+    }
+
     // ── subscriptions ───────────────────────────────────────────────────────
 
     pub fn subscriptions(&self) -> Result<Vec<Subscription>> {
@@ -213,6 +221,17 @@ impl Store {
             read: false,
             vuln: vuln.clone(),
         }))
+    }
+
+    /// Record an alert that was raised elsewhere, as it was there. False if it is already here.
+    pub fn import_alert(&self, sub_id: i64, sub_name: &str, vuln_id: &str, kind: AlertKind, at: DateTime<Utc>, read: bool, vuln: &Value) -> Result<bool> {
+        let exploited = kind == AlertKind::Exploited || vuln["exploited"].as_bool().unwrap_or(false);
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO alerts (sub_id, sub_name, vuln_id, kind, exploited, created_at, read, vuln)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![sub_id, sub_name, vuln_id, kind.as_str(), exploited, at.to_rfc3339(), read, vuln.to_string()],
+        )?;
+        Ok(n == 1)
     }
 
     /// Newest first. `before_id` pages backwards; `after_id` returns only newer alerts (oldest first).
