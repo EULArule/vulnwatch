@@ -17,10 +17,49 @@ export const app = $state({
   toasts: [] as { id: number; text: string; kind: 'info' | 'error' }[],
 });
 
+// Scroll position per history entry, so Back (in-app or Android's) returns to where you were.
+// Each entry is tagged with a key in history.state; a fresh entry (a link was followed) has none.
+if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+const scrolls = new Map<string, number>();
+function entryKey(): { key: string; fresh: boolean } {
+  const key = history.state?.vwKey;
+  if (key) return { key, fresh: false };
+  const made = Math.random().toString(36).slice(2);
+  history.replaceState({ ...(history.state ?? {}), vwKey: made }, '');
+  return { key: made, fresh: true };
+}
+let entry = entryKey().key;
+let stopRestore = () => {};
+
 window.addEventListener('hashchange', () => {
+  scrolls.set(entry, window.scrollY);
+  const next = entryKey();
+  entry = next.key;
   app.route = parseRoute();
-  window.scrollTo(0, 0);
+  stopRestore();
+  const y = next.fresh ? 0 : (scrolls.get(entry) ?? 0);
+  window.scrollTo(0, y);
+  if (y > 0) stopRestore = restoreScroll(y);
 });
+
+/** Pages load their content after showing: keep scrolling to `y` as the page grows, until it
+ *  gets there, the user scrolls themselves, or a few seconds pass. */
+function restoreScroll(y: number): () => void {
+  const reached = () => Math.abs(window.scrollY - y) < 2;
+  const ro = new ResizeObserver(() => {
+    window.scrollTo(0, y);
+    if (reached()) stop();
+  });
+  const stop = () => {
+    ro.disconnect();
+    clearTimeout(timer);
+    for (const ev of ['touchstart', 'wheel', 'keydown'] as const) window.removeEventListener(ev, stop);
+  };
+  const timer = setTimeout(stop, 4000);
+  for (const ev of ['touchstart', 'wheel', 'keydown'] as const) window.addEventListener(ev, stop, { passive: true });
+  ro.observe(document.body);
+  return stop;
+}
 
 export function go(path: string) {
   location.hash = '#' + path;

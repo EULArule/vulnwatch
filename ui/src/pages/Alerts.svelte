@@ -1,4 +1,11 @@
+<script lang="ts" module>
+  /** How many alerts each list showed last time ("Load older" included), so coming back to it
+   *  shows the same rows and the scroll position can be restored. */
+  const shown = new Map<string, number>();
+</script>
+
 <script lang="ts">
+  import { untrack } from 'svelte';
   import type { Alert } from '../lib/types';
   import { app, call, check, checkNow, refreshSubs, watchCheck } from '../lib/state.svelte';
   import { ago, dayLabel } from '../lib/format';
@@ -34,15 +41,17 @@
 
   async function load(append = false, quiet = false) {
     if (!append && !quiet) loading = true;
+    const key = `${subId}|${unreadOnly}`;
     const r = await call('alerts.list', {
       sub_id: subId,
       unread_only: unreadOnly,
       before_id: append ? alerts[alerts.length - 1]?.id : null,
-      limit: 50,
+      limit: append ? 50 : Math.min(500, Math.max(50, shown.get(key) ?? 0, untrack(() => alerts.length))),
     });
     loading = false;
     if (!r) return;
     alerts = append ? [...alerts, ...r.alerts] : r.alerts;
+    shown.set(key, alerts.length);
     more = r.more;
     if (!append) kept = !!r.kept;
     if (app.status) app.status.unread = r.unread;
