@@ -644,7 +644,7 @@ impl Core {
 }
 
 /// Do two targets name the same thing? A product's extra keywords are not part of what it is.
-fn same_target(a: &Target, b: &Target) -> bool {
+pub(crate) fn same_target(a: &Target, b: &Target) -> bool {
     match (a, b) {
         (Target::Product { vendor: v1, product: p1, .. }, Target::Product { vendor: v2, product: p2, .. }) => v1 == v2 && p1 == p2,
         _ => a == b,

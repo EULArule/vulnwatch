@@ -94,8 +94,9 @@ fn page(net: &Net, vendor: &str, product: &str, from: NaiveDate, n: usize) -> Re
     Ok((body["total"].as_u64().unwrap_or(0) as usize, items))
 }
 
-/// Everything published since `from` under exactly this vendor/product name (compared `norm`ed).
-pub fn since(net: &Net, vendor: &str, product: &str, from: NaiveDate) -> Result<Found> {
+/// Everything published since `from` under this vendor/product name: exactly (compared
+/// `norm`ed), or as `belongs` decides, since EUVD's search also returns near names.
+pub fn since(net: &Net, vendor: &str, product: &str, from: NaiveDate, belongs: &dyn Fn(&Advisory) -> bool) -> Result<Found> {
     let (vendor, product) = (norm(vendor), norm(product));
     let (vendor, product) = (vendor.as_str(), product.as_str());
     let (total, mut items) = page(net, vendor, product, from, 0)?;
@@ -115,7 +116,7 @@ pub fn since(net: &Net, vendor: &str, product: &str, from: NaiveDate) -> Result<
     let named = |a: &Advisory| {
         a.affected.iter().any(|x| x.vendor.as_deref().map(norm).as_deref() == Some(vendor) && x.product.as_deref().map(norm).as_deref() == Some(product))
     };
-    let mut items = crate::model::merge_all(items.into_iter().filter(named));
+    let mut items = crate::model::merge_all(items.into_iter().filter(|a| named(a) || belongs(a)));
     items.sort_by(|a, b| b.published.cmp(&a.published).then_with(|| b.id.cmp(&a.id)));
     Ok(Found { items, truncated: total > pages * PAGE })
 }

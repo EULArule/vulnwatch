@@ -151,14 +151,17 @@ impl Core {
                 let listing = if quick { self.quick_listing(&settings, &target)? } else { self.listing(&settings, &target, end, refresh)? };
                 // What is on a page the user watches belongs in their alerts too.
                 let new_alerts = if quick { 0 } else { self.alert_on_view(&settings, &target, &listing.items) };
+                let mut items: Vec<Value> = listing.items.iter().map(|a| a.view(false)).collect();
+                // And what alerted for it is on the page, even when no source lists it here yet.
+                let added = if end.is_none() { self.with_alerted(&target, &mut items)? } else { 0 };
                 Ok(json!({
                     "new_alerts": new_alerts,
                     "partial": quick && listing.next_end == Some(usize::MAX),
-                    "total": listing.total,
+                    "total": listing.total + added,
                     "approx": listing.approx,
                     "next_end": listing.next_end.filter(|e| *e != usize::MAX),
                     "notes": listing.notes,
-                    "items": listing.items.iter().map(|a| a.view(false)).collect::<Vec<_>>(),
+                    "items": items,
                 }))
             }
             "vulns.get" => {
@@ -456,7 +459,7 @@ impl Core {
         }
         let mut items = match target {
             Target::Product { vendor, product, .. } if settings.use_circl => {
-                let alias_key = format!("alias:{}", serde_json::to_string(target)?);
+                let alias_key = format!("publisher:{}", serde_json::to_string(target)?);
                 let alias: Option<(String, String)> =
                     self.db().cache_get(&alias_key, 30 * 86400)?.and_then(|v| serde_json::from_value(v).ok());
                 let (v, p) = alias.as_ref().map(|(v, p)| (v.as_str(), p.as_str())).unwrap_or((vendor, product));
@@ -497,9 +500,26 @@ impl Core {
         let mut down = self.circl_down();
         if settings.use_circl && down.is_none() {
             match circl::by_product_page(&self.net, vendor, product, PAGE, k, true) {
-                Ok(list) => {
+                Ok(mut list) => {
                     if k == 1 {
                         self.db().cache_put(&key, &json!(list)).ok();
+                        // CIRCL can be days behind CVE.org; EUVD often has the newest already.
+                        // Only what is newer than CIRCL's newest is asked for, and only what falls
+                        // within this page is kept, so the pages after it still follow on.
+                        if settings.use_euvd {
+                            let newest = list.iter().filter_map(|a| a.published).chain(newest_nvd).max();
+                            let oldest = list.iter().filter_map(|a| a.published).min().filter(|_| list.len() >= PAGE);
+                            match self.euvd_since(vendor, product, newest, 2) {
+                                Ok(found) => {
+                                    let on_page = found.items.into_iter().filter(|a| match (a.published, oldest) {
+                                        (Some(p), Some(o)) => p >= o,
+                                        _ => true,
+                                    });
+                                    list = merge_all(list.into_iter().chain(on_page));
+                                }
+                                Err(e) => notes.push(format!("EUVD lookup failed, the newest CVEs may be missing: {e:#}")),
+                            }
+                        }
                     }
                     return list;
                 }
@@ -511,7 +531,8 @@ impl Core {
             }
         }
         if settings.use_euvd {
-            match self.euvd_since(vendor, product, newest_nvd) {
+            // A week of overlap: NVD does not analyse in order of publication.
+            match self.euvd_since(vendor, product, newest_nvd, 7) {
                 Ok(found) => {
                     if let Some(down) = &down {
                         notes.push(format!("{down}. The newest CVEs come from ENISA's EUVD instead."));
@@ -556,19 +577,60 @@ impl Core {
         self.db().cache_get(CIRCL_DOWN, 120).ok().flatten().and_then(|v| v.as_str().map(str::to_string))
     }
 
-    /// EUVD's records for a name since shortly before `newest_nvd`, kept for a while: every page
-    /// of a listing is cut from the same download.
-    fn euvd_since(&self, vendor: &str, product: &str, newest_nvd: Option<DateTime<Utc>>) -> Result<euvd::Found> {
-        // A week of overlap: NVD does not analyse in order of publication.
+    /// EUVD's records for a name since `overlap` days before `newest` (NVD's newest, or CIRCL's),
+    /// kept for a while: every page of a listing is cut from the same download.
+    fn euvd_since(&self, vendor: &str, product: &str, newest: Option<DateTime<Utc>>, overlap: i64) -> Result<euvd::Found> {
         let floor = Utc::now() - chrono::Duration::days(120);
-        let from = newest_nvd.map(|d| d - chrono::Duration::days(7)).unwrap_or(floor).max(floor).date_naive();
+        let from = newest.map(|d| d - chrono::Duration::days(overlap)).unwrap_or(floor).max(floor).date_naive();
         let key = format!("euvd:{vendor}:{product}:{from}");
         if let Some((items, truncated)) = self.db().cache_get(&key, CACHE_SECS)?.and_then(|v| serde_json::from_value(v).ok()) {
             return Ok(euvd::Found { items, truncated });
         }
-        let found = euvd::since(&self.net, vendor, product, from)?;
+        // What an alert rule for the name would take as being about it: publishers write
+        // "VMware vCenter Server" for `vmware:vcenter_server`.
+        let rule: Subscription = serde_json::from_value(json!({ "name": "", "target": { "kind": "product", "vendor": vendor, "product": product, "keywords": [] } }))?;
+        let rule = Compiled::new(rule)?;
+        let found = euvd::since(&self.net, vendor, product, from, &|a| rule.matches(a))?;
         self.db().cache_put(&key, &json!((&found.items, found.truncated)))?;
         Ok(found)
+    }
+
+    /// Add to the newest page of a list the alerts raised for its target that are not on it.
+    /// An alert can come from a name only its publisher uses, or from a keyword, before NVD,
+    /// CIRCL or EUVD list the CVE under the product, or without them ever doing so.
+    /// Returns how many were added.
+    fn with_alerted(&self, target: &Target, items: &mut Vec<Value>) -> Result<usize> {
+        let db = self.db();
+        let mut known: std::collections::HashSet<String> = Default::default();
+        for v in items.iter() {
+            known.extend(vuln_ids(v));
+        }
+        let mut added = 0;
+        for sub in db.subscriptions()?.into_iter().filter(|s| crate::engine::same_target(&s.target, target)) {
+            for alert in db.alerts(Some(sub.id), false, None, None, 500)? {
+                let mut v = alert.vuln;
+                let ids = vuln_ids(&v);
+                if v["id"].is_null() || ids.iter().any(|i| known.contains(i)) {
+                    continue;
+                }
+                known.extend(ids);
+                if let Some(o) = v.as_object_mut() {
+                    // The snapshot is the full view; a list row has no use for the rest.
+                    for k in ["description", "scores", "products", "cwes", "references"] {
+                        o.remove(k);
+                    }
+                }
+                items.push(v);
+                added += 1;
+            }
+        }
+        if added > 0 {
+            let published = |v: &Value| v["published"].as_str().and_then(|s| s.parse::<DateTime<Utc>>().ok());
+            items.sort_by(|a, b| {
+                published(b).cmp(&published(a)).then_with(|| b["id"].as_str().cmp(&a["id"].as_str()))
+            });
+        }
+        Ok(added)
     }
 
     /// The newest page of a target's list (reusing a recent copy).
@@ -644,7 +706,7 @@ impl Core {
                     // NVD takes weeks to attach its product name to a new CVE. Until then a CVE
                     // only carries the name its publisher uses ("Linux Linux" for the kernel),
                     // so learn that name from the CVEs we do have and ask CIRCL for it as well.
-                    let alias_key = format!("alias:{}", serde_json::to_string(target)?);
+                    let alias_key = format!("publisher:{}", serde_json::to_string(target)?);
                     let alias = publisher_name(&items, vendor, product);
                     if let Some(a) = &alias {
                         self.db().cache_put(&alias_key, &json!(a))?;
@@ -655,10 +717,22 @@ impl Core {
                     };
                     let k = ahead_page.unwrap_or(1);
                     let newest_nvd = items.iter().filter_map(|a| a.published).max();
-                    let ahead = match &alias {
-                        Some((v, p)) => self.by_publisher_name(settings, v, p, k, newest_nvd, &mut notes),
-                        None => vec![],
-                    };
+                    // The publisher's name and the CPE name are looked up side by side (each can
+                    // take a few seconds); the second is only used on the newest page.
+                    let (ahead, by_cpe_name) = std::thread::scope(|s| {
+                        let by_cpe_name = (k == 1).then(|| {
+                            s.spawn(|| {
+                                let mut notes = vec![];
+                                let list = self.by_publisher_name(settings, vendor, product, 1, newest_nvd, &mut notes);
+                                (list, notes)
+                            })
+                        });
+                        let ahead = match &alias {
+                            Some((v, p)) => self.by_publisher_name(settings, v, p, k, newest_nvd, &mut notes),
+                            None => vec![],
+                        };
+                        (ahead, by_cpe_name.and_then(|h| h.join().ok()))
+                    });
                     // A whole page newer than NVD's newest: show it by itself and continue with
                     // the next such page, so no stretch of recent CVEs is skipped.
                     let gap = k < 200
@@ -669,8 +743,9 @@ impl Core {
                         items = std::mem::take(&mut extra);
                         next = Some(AHEAD + k + 1);
                         approx = true;
-                    } else if k == 1 {
-                        extra.extend(self.by_publisher_name(settings, vendor, product, 1, newest_nvd, &mut notes));
+                    } else if let Some((list, more)) = by_cpe_name {
+                        extra.extend(list);
+                        notes.extend(more);
                     }
                     if let (1, Some(token)) = (k, settings.cvedetails_key()) {
                         match cvedetails::by_product(&self.net, token, vendor, product, PAGE, 1) {
@@ -1044,6 +1119,54 @@ mod tests {
     }
 
     #[test]
+    fn the_publisher_name_keeps_its_spelling() {
+        use crate::model::Affected;
+        let adv = |i: usize, v: &str, p: &str| {
+            let mut a = Advisory::new(&format!("CVE-2026-{i}"), "cve.org");
+            a.affected.push(Affected { vendor: Some(v.into()), product: Some(p.into()), ..Default::default() });
+            a
+        };
+        let mut items: Vec<Advisory> = (0..4).map(|i| adv(i, "VMware", "VMware vCenter Server")).collect();
+        items.push(adv(9, "vmware", "vmware vcenter server"));
+        assert_eq!(publisher_name(&items, "vmware", "vcenter_server"), Some(("VMware".into(), "VMware vCenter Server".into())));
+        // Too few to tell, or the same as the CPE name: nothing to learn.
+        assert_eq!(publisher_name(&items[..4], "vmware", "vcenter_server"), None);
+        let same: Vec<Advisory> = (0..5).map(|i| adv(i, "OpenBSD", "OpenSSH")).collect();
+        assert_eq!(publisher_name(&same, "openbsd", "openssh"), None);
+    }
+
+    #[test]
+    fn a_product_page_shows_what_alerted_for_it() {
+        use crate::store::AlertKind;
+        let c = core();
+        let product = |p: &str| json!({ "kind": "product", "vendor": "vmware", "product": p, "keywords": ["vcenter server"] });
+        let sub = c
+            .call("subs.save", json!({ "subscription": { "id": 0, "name": "vCenter", "target": product("vcenter_server"), "filter": crate::matcher::Filter::default(), "enabled": true, "notify": true } }))
+            .unwrap();
+        let sub_id = sub["subscription"]["id"].as_i64().unwrap();
+        let snapshot = |id: &str, published: &str| json!({ "id": id, "aliases": [], "published": published, "summary": "s", "description": "long", "references": [] });
+        // Published by VMware under its own name, not yet listed under the product anywhere.
+        c.db().insert_alert(sub_id, "vCenter", "CVE-2026-123903", AlertKind::New, false, &snapshot("CVE-2026-123903", "2026-11-26T10:08:04Z")).unwrap();
+        // Already on the page under another id.
+        c.db().insert_alert(sub_id, "vCenter", "GHSA-x", AlertKind::New, false, &json!({ "id": "GHSA-x", "aliases": ["CVE-2026-1"], "published": "2026-11-01T00:00:00Z" })).unwrap();
+
+        let target: Target = serde_json::from_value(product("vcenter_server")).unwrap();
+        let mut items = vec![
+            json!({ "id": "CVE-2026-2", "aliases": [], "published": "2026-11-20T00:00:00Z" }),
+            json!({ "id": "CVE-2026-1", "aliases": [], "published": "2026-11-01T00:00:00Z" }),
+        ];
+        assert_eq!(c.with_alerted(&target, &mut items).unwrap(), 1);
+        let ids: Vec<&str> = items.iter().map(|v| v["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["CVE-2026-123903", "CVE-2026-2", "CVE-2026-1"]);
+        assert!(items[0].get("description").is_none());
+
+        // Another product's page is left alone.
+        let other: Target = serde_json::from_value(product("esxi")).unwrap();
+        let mut items = vec![];
+        assert_eq!(c.with_alerted(&other, &mut items).unwrap(), 0);
+    }
+
+    #[test]
     fn alerted_vulnerabilities_are_kept_for_offline_reading() {
         use crate::store::{Alert, AlertKind};
         let c = core();
@@ -1128,24 +1251,41 @@ mod tests {
 // Far above any NVD position, and still fits a 32-bit usize (armv7 phones).
 const AHEAD: usize = 1 << 30;
 
+/// A listed vulnerability's id and aliases.
+fn vuln_ids(v: &Value) -> Vec<String> {
+    let id = v["id"].as_str().map(str::to_string);
+    let aliases = v["aliases"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(str::to_string));
+    id.into_iter().chain(aliases).collect()
+}
+
 fn publisher_name(items: &[Advisory], vendor: &str, product: &str) -> Option<(String, String)> {
     use crate::matcher::norm;
-    let mut counts: std::collections::HashMap<(String, String), usize> = Default::default();
+    // Counted by the `norm`ed name; answered with the spelling used most, as CIRCL only finds a
+    // name written the way it was published ("VMware vCenter Server", not "vmware_vcenter_server").
+    let mut counts: std::collections::HashMap<(String, String), (usize, std::collections::HashMap<(String, String), usize>)> = Default::default();
     let mut declared = 0;
     for a in items {
-        let mut names: Vec<(String, String)> = a
+        let mut names: Vec<((String, String), (String, String))> = a
             .affected
             .iter()
-            .filter_map(|x| Some((norm(x.vendor.as_deref()?), norm(x.product.as_deref()?))))
-            .filter(|(v, p)| !v.is_empty() && !p.is_empty() && v != "n_a" && p != "n_a")
+            .filter_map(|x| {
+                let raw = (x.vendor.as_deref()?.trim().to_string(), x.product.as_deref()?.trim().to_string());
+                Some(((norm(&raw.0), norm(&raw.1)), raw))
+            })
+            .filter(|((v, p), _)| !v.is_empty() && !p.is_empty() && v != "n_a" && p != "n_a")
             .collect();
         names.sort();
-        names.dedup();
+        names.dedup_by(|a, b| a.0 == b.0);
         declared += usize::from(!names.is_empty());
-        for n in names {
-            *counts.entry(n).or_default() += 1;
+        for (n, raw) in names {
+            let e = counts.entry(n).or_default();
+            e.0 += 1;
+            *e.1.entry(raw).or_default() += 1;
         }
     }
-    let (name, n) = counts.into_iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))?;
-    (declared >= 5 && n * 2 > declared && name != (norm(vendor), norm(product))).then_some(name)
+    let (name, (n, spellings)) = counts.into_iter().max_by(|a, b| a.1 .0.cmp(&b.1 .0).then_with(|| b.0.cmp(&a.0)))?;
+    if !(declared >= 5 && n * 2 > declared && name != (norm(vendor), norm(product))) {
+        return None;
+    }
+    spellings.into_iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0))).map(|(raw, _)| raw)
 }
