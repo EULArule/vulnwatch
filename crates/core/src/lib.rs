@@ -13,6 +13,7 @@ pub mod notify;
 pub mod settings;
 pub mod sources;
 pub mod store;
+mod track;
 mod transfer;
 
 use std::{
@@ -39,6 +40,8 @@ pub struct Core {
     /// Counts `assemble` calls (and keeps them one at a time); see there.
     assembled: Mutex<u64>,
     progress: Mutex<engine::Progress>,
+    /// Lists being loaded (and loaded lately), by the id the UI gave them, for `vulns.progress`.
+    jobs: Mutex<std::collections::HashMap<String, (std::time::Instant, track::Job)>>,
 }
 
 impl Core {
@@ -48,7 +51,7 @@ impl Core {
     }
 
     pub fn with_store(store: Store, mobile: bool) -> Self {
-        Self { store: Mutex::new(store), net: Net::new(), poll_lock: Mutex::new(()), mobile, kev: Mutex::new(None), assembled: Mutex::new(0), progress: Default::default() }
+        Self { store: Mutex::new(store), net: Net::new(), poll_lock: Mutex::new(()), mobile, kev: Mutex::new(None), assembled: Mutex::new(0), progress: Default::default(), jobs: Default::default() }
     }
 
     pub(crate) fn db(&self) -> MutexGuard<'_, Store> {

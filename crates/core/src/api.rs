@@ -148,7 +148,12 @@ impl Core {
                 // records), so the page is not blank while NVD answers. `partial` tells the UI
                 // that the full list is still worth asking for.
                 let quick = params["quick"].as_bool().unwrap_or(false);
-                let listing = if quick { self.quick_listing(&settings, &target)? } else { self.listing(&settings, &target, end, refresh)? };
+                // `job`: an id the UI makes up, to follow the sources this load waits for with
+                // `vulns.progress`. The quick and the full load of a page can share one.
+                let job = params["job"].as_str().map(|id| self.job(id));
+                let listing = crate::track::with(job.clone(), || {
+                    if quick { self.quick_listing(&settings, &target) } else { self.listing(&settings, &target, end, refresh) }
+                })?;
                 // What is on a page the user watches belongs in their alerts too.
                 let new_alerts = if quick { 0 } else { self.alert_on_view(&settings, &target, &listing.items) };
                 let mut items: Vec<Value> = listing.items.iter().map(|a| a.view(false)).collect();
@@ -162,7 +167,13 @@ impl Core {
                     "next_end": listing.next_end.filter(|e| *e != usize::MAX),
                     "notes": listing.notes,
                     "items": items,
+                    "steps": job.as_ref().map(crate::track::view).unwrap_or_default(),
                 }))
+            }
+            "vulns.progress" => {
+                let id = text(&params, "job")?;
+                let job = self.jobs.lock().unwrap_or_else(|p| p.into_inner()).get(&id).map(|(_, j)| j.clone());
+                Ok(json!({ "steps": job.as_ref().map(crate::track::view).unwrap_or_default() }))
             }
             "vulns.get" => {
                 let id = text(&params, "id")?;
@@ -449,6 +460,13 @@ impl Core {
         vuln_parts(id).iter().filter(|p| **p != "kev").all(|p| matches!(db.cache_get(&part_key(id, p), CACHE_SECS), Ok(Some(_))))
     }
 
+    /// The job of a list load with this id, made if new. Jobs over ten minutes old are dropped.
+    fn job(&self, id: &str) -> crate::track::Job {
+        let mut jobs = self.jobs.lock().unwrap_or_else(|p| p.into_inner());
+        jobs.retain(|_, (at, _)| at.elapsed() < std::time::Duration::from_secs(600));
+        jobs.entry(id.to_string()).or_insert_with(|| (std::time::Instant::now(), Default::default())).1.clone()
+    }
+
     /// One page of a target's vulnerability history, newest first.
     /// A first look that needs no slow request: the cached full list if there is one, otherwise
     /// CIRCL's newest records for a product (about a second). `next_end == usize::MAX` marks it partial.
@@ -465,7 +483,7 @@ impl Core {
                 let (v, p) = alias.as_ref().map(|(v, p)| (v.as_str(), p.as_str())).unwrap_or((vendor, product));
                 // No waiting here: CIRCL right now, or else what it said last time.
                 let live = match self.circl_down() {
-                    None => circl::by_product_page(&self.net, v, p, PAGE, 1, false).ok(),
+                    None => crate::track::step("CIRCL, a first look", || circl::by_product_page(&self.net, v, p, PAGE, 1, false)).ok(),
                     Some(_) => None,
                 };
                 match live {
@@ -499,7 +517,7 @@ impl Core {
         let key = circl_key(vendor, product);
         let mut down = self.circl_down();
         if settings.use_circl && down.is_none() {
-            match circl::by_product_page(&self.net, vendor, product, PAGE, k, true) {
+            match crate::track::step(&format!("CIRCL: {vendor} {product}"), || circl::by_product_page(&self.net, vendor, product, PAGE, k, true)) {
                 Ok(mut list) => {
                     if k == 1 {
                         self.db().cache_put(&key, &json!(list)).ok();
@@ -590,7 +608,7 @@ impl Core {
         // "VMware vCenter Server" for `vmware:vcenter_server`.
         let rule: Subscription = serde_json::from_value(json!({ "name": "", "target": { "kind": "product", "vendor": vendor, "product": product, "keywords": [] } }))?;
         let rule = Compiled::new(rule)?;
-        let found = euvd::since(&self.net, vendor, product, from, &|a| rule.matches(a))?;
+        let found = crate::track::step(&format!("EUVD: {vendor} {product}"), || euvd::since(&self.net, vendor, product, from, &|a| rule.matches(a)))?;
         self.db().cache_put(&key, &json!((&found.items, found.truncated)))?;
         Ok(found)
     }
@@ -679,7 +697,7 @@ impl Core {
                         approx = a;
                         (t, n, i)
                     }
-                    None => from_page(nvd::by_product(&self.net, key, vendor, product, end, PAGE, hint)?),
+                    None => from_page(crate::track::step("NVD", || nvd::by_product(&self.net, key, vendor, product, end, PAGE, hint))?),
                 };
                 // NVD also returns CVEs that merely list this product as the platform something
                 // else runs on ("IBM Foo running on Linux"). Keep only those where it is the
@@ -692,7 +710,7 @@ impl Core {
                 approx |= items.len() < fetched;
                 for _ in 0..2 {
                     let Some(e) = next.filter(|_| fresh && items.len() < PAGE / 4) else { break };
-                    let older = nvd::by_product(&self.net, key, vendor, product, Some(e), PAGE, None)?;
+                    let older = crate::track::step("NVD, older pages", || nvd::by_product(&self.net, key, vendor, product, Some(e), PAGE, None))?;
                     next = (older.start > 0).then_some(older.start);
                     approx = true;
                     items.extend(older.items.into_iter().filter(about));
@@ -719,13 +737,14 @@ impl Core {
                     let newest_nvd = items.iter().filter_map(|a| a.published).max();
                     // The publisher's name and the CPE name are looked up side by side (each can
                     // take a few seconds); the second is only used on the newest page.
+                    let job = crate::track::current();
                     let (ahead, by_cpe_name) = std::thread::scope(|s| {
                         let by_cpe_name = (k == 1).then(|| {
-                            s.spawn(|| {
+                            s.spawn(|| crate::track::with(job, || {
                                 let mut notes = vec![];
                                 let list = self.by_publisher_name(settings, vendor, product, 1, newest_nvd, &mut notes);
                                 (list, notes)
-                            })
+                            }))
                         });
                         let ahead = match &alias {
                             Some((v, p)) => self.by_publisher_name(settings, v, p, k, newest_nvd, &mut notes),
@@ -748,7 +767,7 @@ impl Core {
                         notes.extend(more);
                     }
                     if let (1, Some(token)) = (k, settings.cvedetails_key()) {
-                        match cvedetails::by_product(&self.net, token, vendor, product, PAGE, 1) {
+                        match crate::track::step("CVEdetails", || cvedetails::by_product(&self.net, token, vendor, product, PAGE, 1)) {
                             Ok(list) => extra.extend(list),
                             Err(e) => notes.push(format!("CVEdetails lookup failed: {e:#}")),
                         }
@@ -765,7 +784,7 @@ impl Core {
                 (total, next, items)
             }
             Target::Vendor { vendor } => {
-                let (total, next, mut items) = from_page(nvd::by_vendor(&self.net, key, vendor, end, PAGE, hint)?);
+                let (total, next, mut items) = from_page(crate::track::step("NVD", || nvd::by_vendor(&self.net, key, vendor, end, PAGE, hint))?);
                 items.retain(|a| a.affected.iter().flat_map(|x| &x.cpes).filter_map(|c| cpe_vendor_product(c)).any(|(v, _)| v == *vendor));
                 (total, next, items)
             }
@@ -773,12 +792,12 @@ impl Core {
                 let words: Vec<&String> = keywords.iter().filter(|k| !k.trim().is_empty()).take(3).collect();
                 match words.as_slice() {
                     [] => bail!("enter at least one keyword"),
-                    [one] => from_page(nvd::by_keyword(&self.net, key, one, end, PAGE, hint)?),
+                    [one] => from_page(crate::track::step("NVD", || nvd::by_keyword(&self.net, key, one, end, PAGE, hint))?),
                     many => {
                         let mut all = vec![];
                         let mut total = 0;
                         for w in many {
-                            let page = nvd::by_keyword(&self.net, key, w, None, PAGE, None)?;
+                            let page = crate::track::step(&format!("NVD: {w}"), || nvd::by_keyword(&self.net, key, w, None, PAGE, None))?;
                             total += page.total;
                             all.extend(page.items);
                         }
@@ -788,10 +807,10 @@ impl Core {
                 }
             }
             Target::Package { ecosystem, name } => {
-                let items = osv::by_package(&self.net, ecosystem, name)?;
+                let items = crate::track::step("OSV", || osv::by_package(&self.net, ecosystem, name))?;
                 (items.len(), None, items)
             }
-            Target::Everything => from_page(nvd::latest(&self.net, key, end, PAGE, hint)?),
+            Target::Everything => from_page(crate::track::step("NVD", || nvd::latest(&self.net, key, end, PAGE, hint))?),
         };
         let kev = self.kev_ready();
         for a in &mut items {

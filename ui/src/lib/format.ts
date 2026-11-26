@@ -92,3 +92,8 @@ export function filterLabel(f: Filter): string {
 export function partLabel(part: string): string {
   return part === 'o' ? 'Operating system' : part === 'h' ? 'Hardware' : 'Software';
 }
+
+/** A duration for progress lines: tenths of a second while short, whole seconds after. */
+export function secs(ms: number, whole = false): string {
+  return whole || ms >= 10_000 ? `${Math.floor(ms / 1000)}s` : `${(ms / 1000).toFixed(1)}s`;
+}

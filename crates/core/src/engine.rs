@@ -18,6 +18,7 @@ use crate::notify::{self, Notification};
 use crate::settings::Settings;
 use crate::sources::{cvelist, epss, kev, nvd, osv, parse_time};
 use crate::store::{Alert, AlertKind};
+use crate::track::Step;
 use crate::Core;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -42,14 +43,6 @@ pub(crate) struct Progress {
     took: Option<Elapsed>,
     new_alerts: usize,
     steps: Vec<Step>,
-}
-
-/// One thing a check waits for, usually a request to one source.
-struct Step {
-    name: String,
-    started: Instant,
-    took: Option<Elapsed>,
-    error: Option<String>,
 }
 
 /// Marks the check as over when dropped, however `poll` is left.
@@ -205,20 +198,20 @@ impl Core {
 
     /// Do one part of a check, keeping time for `check_progress`. Outside a check it only runs `work`.
     fn step<T>(&self, name: &str, work: impl FnOnce() -> Result<T>) -> Result<T> {
-        let started = Instant::now();
         let slot = {
             let mut p = self.progress();
             p.running.then(|| {
-                p.steps.push(Step { name: name.to_string(), started, took: None, error: None });
-                p.steps.len() - 1
+                let step = Step::new(name);
+                let started = step.started;
+                p.steps.push(step);
+                (p.steps.len() - 1, started)
             })
         };
         let out = work();
-        if let Some(i) = slot {
+        if let Some((i, started)) = slot {
             let mut p = self.progress();
             if let Some(s) = p.steps.get_mut(i).filter(|s| s.started == started) {
-                s.took = Some(started.elapsed());
-                s.error = out.as_ref().err().map(|e| format!("{e:#}"));
+                s.finish(&out);
             }
         }
         out
@@ -229,18 +222,7 @@ impl Core {
     pub fn check_progress(&self) -> Value {
         let p = self.progress();
         let ms = |d: Elapsed| d.as_millis() as u64;
-        let steps: Vec<Value> = p
-            .steps
-            .iter()
-            .map(|s| {
-                let state = match (&s.took, &s.error) {
-                    (None, _) => "running",
-                    (_, Some(_)) => "failed",
-                    _ => "done",
-                };
-                json!({ "name": s.name, "state": state, "ms": ms(s.took.unwrap_or_else(|| s.started.elapsed())), "error": s.error })
-            })
-            .collect();
+        let steps: Vec<Value> = p.steps.iter().map(Step::view).collect();
         json!({
             "running": p.running,
             "ms": p.took.or(p.started.map(|t| t.elapsed())).map(ms),
@@ -622,7 +604,7 @@ impl Core {
         if !current.is_empty() {
             return current;
         }
-        self.refresh_kev(true).map(|x| x.0).unwrap_or(current)
+        crate::track::step("CISA KEV", || self.refresh_kev(true)).map(|x| x.0).unwrap_or(current)
     }
 
     pub fn add_epss(&self, advisories: &mut [&mut Advisory]) -> Result<()> {
@@ -632,7 +614,7 @@ impl Core {
         if ids.is_empty() {
             return Ok(());
         }
-        let scores = epss::lookup(&self.net, &ids)?;
+        let scores = crate::track::step("EPSS", || epss::lookup(&self.net, &ids))?;
         for a in advisories.iter_mut() {
             if let Some((p, pct)) = a.cve_id().and_then(|id| scores.get(id)) {
                 a.epss = Some(*p);

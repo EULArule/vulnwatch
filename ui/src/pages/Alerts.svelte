@@ -8,9 +8,10 @@
   import { untrack } from 'svelte';
   import type { Alert } from '../lib/types';
   import { app, call, check, checkNow, refreshSubs, watchCheck } from '../lib/state.svelte';
-  import { ago, dayLabel } from '../lib/format';
+  import { ago, dayLabel, secs } from '../lib/format';
   import Icon from '../components/Icon.svelte';
   import VulnRow from '../components/VulnRow.svelte';
+  import Steps from '../components/Steps.svelte';
 
   let { subId = null }: { subId?: number | null } = $props();
 
@@ -80,10 +81,6 @@
     lastChange = check.changes;
   });
 
-  function secs(ms: number, whole = false) {
-    return whole || ms >= 10_000 ? `${Math.floor(ms / 1000)}s` : `${(ms / 1000).toFixed(1)}s`;
-  }
-
   const groups = $derived.by(() => {
     const out: { day: string; items: Alert[] }[] = [];
     for (const a of alerts) {
@@ -150,32 +147,15 @@
 </header>
 
 {#if check.open && (check.running || check.steps.length)}
-  <div class="card steps">
-    <div class="row top">
-      <b class="grow small">
-        {#if check.running}
-          Checking{check.found ? ` · ${check.found} new so far` : ''}
-        {:else}
-          Last check took {secs(check.ms ?? 0)}{check.found ? ` · ${check.found} new` : ''}
-        {/if}
-      </b>
-      <button class="del" onclick={() => (check.open = false)} aria-label="Hide" title="Hide"><Icon name="x" size={16} /></button>
-    </div>
-    {#each check.steps as s, i (i)}
-      <div class="step {s.state}">
-        <span class="mark">
-          {#if s.state === 'running'}<span class="spinner"></span>{:else}<Icon name={s.state === 'done' ? 'check' : 'x'} size={17} />{/if}
-        </span>
-        <span class="grow what">
-          {s.name}
-          {#if s.error}<span class="small why">{s.error}</span>{/if}
-        </span>
-        <span class="took small">{secs(s.ms, s.state === 'running')}</span>
-      </div>
-    {:else}
-      <div class="step muted small">Starting…</div>
-    {/each}
-  </div>
+  <Steps steps={check.steps} onclose={() => (check.open = false)}>
+    {#snippet title()}
+      {#if check.running}
+        Checking{check.found ? ` · ${check.found} new so far` : ''}
+      {:else}
+        Last check took {secs(check.ms ?? 0)}{check.found ? ` · ${check.found} new` : ''}
+      {/if}
+    {/snippet}
+  </Steps>
 {:else if !check.running && check.steps.length}
   <p class="lastrun"><button class="link small" onclick={() => (check.open = true)}>What the last check did</button></p>
 {/if}
@@ -237,54 +217,6 @@
   }
   .err {
     color: var(--danger);
-  }
-  .steps {
-    margin-bottom: 0.8rem;
-    padding: 0.5rem 1rem 0.6rem;
-  }
-  .steps .top {
-    min-height: 2rem;
-  }
-  .step {
-    display: flex;
-    align-items: flex-start;
-    gap: 0.6rem;
-    padding: 0.3rem 0;
-  }
-  .mark {
-    flex: none;
-    display: grid;
-    place-items: center;
-    width: 1.2rem;
-    height: 1.3rem;
-  }
-  .mark .spinner {
-    width: 15px;
-    height: 15px;
-    border-width: 2px;
-  }
-  .step.done .mark {
-    color: var(--ok);
-  }
-  .step.failed .mark,
-  .why {
-    color: var(--danger);
-  }
-  .what {
-    min-width: 0;
-    overflow-wrap: anywhere;
-  }
-  .why {
-    display: block;
-  }
-  .took {
-    flex: none;
-    color: var(--muted);
-    font-variant-numeric: tabular-nums;
-  }
-  .step.running .took {
-    color: var(--text);
-    font-weight: 600;
   }
   .lastrun {
     margin: -0.5rem 0 0.5rem;
